@@ -17,13 +17,19 @@ uv run mcpshare.py sync   # synchronize MCP settings
 uv run mcpshare.py status # show current state
 ```
 
-### With pip
+### With `uv tool install`
 
 ```bash
-pip install .
+# Install as a global CLI tool
+uv tool install git+https://github.com/eggboy/mcpshare.git
+
+# Then run from anywhere
 mcpshare init
 mcpshare sync
 mcpshare status
+
+# Upgrade to the latest version
+uv tool upgrade mcpshare
 ```
 
 ## Configuration
