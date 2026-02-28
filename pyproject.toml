@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcpshare"
+version = "0.1.0"
+description = "CLI tool to share MCP configuration between coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+mcpshare = "mcpshare:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+include = ["mcpshare.py"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
