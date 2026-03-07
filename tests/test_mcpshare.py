@@ -1,6 +1,5 @@
 """Tests for mcpshare."""
 
-import argparse
 import json
 import textwrap
 from pathlib import Path
@@ -400,21 +399,21 @@ class TestCollectDistribute:
 class TestCLI:
     def test_init_creates_config(self, tmp_home, monkeypatch):
         monkeypatch.setattr("builtins.input", lambda _: "")
-        args = argparse.Namespace(force=False, source=None)
+        args = mcpshare.Init(force=False, source=None)
         mcpshare.cmd_init(args)
         assert mcpshare.CONFIG_FILE.exists()
 
     def test_init_force_overwrites(self, tmp_home, monkeypatch):
         monkeypatch.setattr("builtins.input", lambda _: "")
-        args = argparse.Namespace(force=False, source=None)
+        args = mcpshare.Init(force=False, source=None)
         mcpshare.cmd_init(args)
-        args = argparse.Namespace(force=True, source=None)
+        args = mcpshare.Init(force=True, source=None)
         mcpshare.cmd_init(args)
         assert mcpshare.CONFIG_FILE.exists()
 
     def test_init_with_source_arg(self, tmp_home, tmp_path):
         custom_source = str(tmp_path / "my_master")
-        args = argparse.Namespace(force=False, source=custom_source)
+        args = mcpshare.Init(force=False, source=custom_source)
         mcpshare.cmd_init(args)
         assert mcpshare.CONFIG_FILE.exists()
         cfg = mcpshare.load_config()
@@ -424,32 +423,17 @@ class TestCLI:
     def test_init_prompt_uses_entered_value(self, tmp_home, tmp_path, monkeypatch):
         custom_source = str(tmp_path / "prompted_master")
         monkeypatch.setattr("builtins.input", lambda _: custom_source)
-        args = argparse.Namespace(force=False, source=None)
+        args = mcpshare.Init(force=False, source=None)
         mcpshare.cmd_init(args)
         cfg = mcpshare.load_config()
         assert cfg["source"] == custom_source
 
     def test_init_prompt_empty_uses_default(self, tmp_home, monkeypatch):
         monkeypatch.setattr("builtins.input", lambda _: "")
-        args = argparse.Namespace(force=False, source=None)
+        args = mcpshare.Init(force=False, source=None)
         mcpshare.cmd_init(args)
         cfg = mcpshare.load_config()
         assert cfg["source"] == mcpshare.default_config()["source"]
-
-    def test_parser_subcommands(self):
-        parser = mcpshare.build_parser()
-        args = parser.parse_args(["init", "--force"])
-        assert args.command == "init"
-        assert args.force is True
-
-        args = parser.parse_args(["init", "--source", "/my/dir"])
-        assert args.source == "/my/dir"
-
-        args = parser.parse_args(["sync"])
-        assert args.command == "sync"
-
-        args = parser.parse_args(["status"])
-        assert args.command == "status"
 
 
 # ---------------------------------------------------------------------------

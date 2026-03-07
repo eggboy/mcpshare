@@ -1,8 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
 #     "pyyaml>=6.0",
+#     "tyro>=0.9",
 # ]
 # ///
 """mcpshare - Synchronize MCP configurations between coding agents.
@@ -11,14 +12,15 @@ Supports VSCode, Claude Code, GitHub Copilot CLI, OpenAI Codex,
 Google Gemini CLI, and OpenCode.
 """
 
-import argparse
 import json
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Union
 
+import tyro
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -587,11 +589,49 @@ def distribute(config: dict[str, Any], master: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CLI subcommand dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Init:
+    """Create default config."""
+
+    force: bool = False
+    """Overwrite existing config."""
+    source: str | None = None
+    """Source folder for master MCP config."""
+
+
+@dataclass
+class Update:
+    """Collect MCP servers from all targets into master."""
+
+
+@dataclass
+class Sync:
+    """Distribute master MCP config to all targets."""
+
+
+@dataclass
+class Status:
+    """Show current config status."""
+
+
+Command = Union[
+    Annotated[Init, tyro.conf.subcommand("init")],
+    Annotated[Update, tyro.conf.subcommand("update")],
+    Annotated[Sync, tyro.conf.subcommand("sync")],
+    Annotated[Status, tyro.conf.subcommand("status")],
+]
+
+
+# ---------------------------------------------------------------------------
 # CLI commands
 # ---------------------------------------------------------------------------
 
 
-def cmd_init(args: argparse.Namespace) -> None:
+def cmd_init(args: Init) -> None:
     """Initialise the mcpshare config file."""
     if CONFIG_FILE.exists() and not args.force:
         print(f"Config already exists: {CONFIG_FILE}")
@@ -612,28 +652,26 @@ def cmd_init(args: argparse.Namespace) -> None:
     print(f"Master directory: {config['source']}")
 
 
-def cmd_sync(args: argparse.Namespace) -> None:
-    """Synchronize MCP settings between tools."""
+def cmd_update(args: Update) -> None:
+    """Collect MCP servers from all targets into master."""
     config = load_config()
-    mode = config.get("mode", "merge")
-
-    if mode == "merge":
-        logger.info("Collecting MCP servers from targets...")
-        master = collect(config)
-    else:
-        logger.info("Loading master config (overwrite mode)...")
-        master = load_master(config["source"])
-
+    logger.info("Collecting MCP servers from targets...")
+    master = collect(config)
     save_master(config["source"], master)
     total = len(master.get("mcpServers", {}))
     logger.info("Master updated with %d server(s).", total)
 
+
+def cmd_sync(args: Sync) -> None:
+    """Distribute master MCP config to all targets."""
+    config = load_config()
+    master = load_master(config["source"])
     logger.info("Distributing to targets...")
     distribute(config, master)
     logger.info("Sync complete.")
 
 
-def cmd_status(args: argparse.Namespace) -> None:
+def cmd_status(args: Status) -> None:
     """Show current configuration status."""
     config = load_config()
     source_dir = config["source"]
@@ -658,24 +696,6 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(f"  {exists} {tool}: {target_path}")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Build the argument parser."""
-    parser = argparse.ArgumentParser(
-        prog="mcpshare",
-        description="Synchronize MCP configurations between coding agents.",
-    )
-    sub = parser.add_subparsers(dest="command")
-
-    init_p = sub.add_parser("init", help="Create default config")
-    init_p.add_argument("--force", action="store_true", help="Overwrite existing config")
-    init_p.add_argument("--source", metavar="DIR", help="Source folder for master MCP config")
-
-    sub.add_parser("sync", help="Synchronize MCP settings between tools")
-    sub.add_parser("status", help="Show current config status")
-
-    return parser
-
-
 def main() -> None:
     """CLI entry point."""
     logging.basicConfig(
@@ -683,23 +703,20 @@ def main() -> None:
         format="%(message)s",
     )
 
-    parser = build_parser()
-    args = parser.parse_args()
+    cmd = tyro.cli(Command, prog="mcpshare", description="Synchronize MCP configurations between coding agents.")
 
-    commands = {
-        "init": cmd_init,
-        "sync": cmd_sync,
-        "status": cmd_status,
-    }
-
-    if args.command in commands:
-        try:
-            commands[args.command](args)
-        except McpShareError as exc:
-            logger.error("%s", exc)
-            sys.exit(1)
-    else:
-        parser.print_help()
+    try:
+        if isinstance(cmd, Init):
+            cmd_init(cmd)
+        elif isinstance(cmd, Update):
+            cmd_update(cmd)
+        elif isinstance(cmd, Sync):
+            cmd_sync(cmd)
+        elif isinstance(cmd, Status):
+            cmd_status(cmd)
+    except McpShareError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

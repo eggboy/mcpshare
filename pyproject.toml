@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
     "pyyaml>=6.0",
+    "tyro>=0.9",
 ]
 
 [project.scripts]
@@ -29,3 +30,8 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
