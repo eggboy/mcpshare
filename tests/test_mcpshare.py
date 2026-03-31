@@ -252,7 +252,7 @@ class TestWriters:
         assert data["servers"]["remote"]["type"] == "http"
 
     def test_write_claude(self, tmp_path, sample_servers):
-        path = tmp_path / ".mcp.json"
+        path = tmp_path / "mcp_servers.json"
         mcpshare.write_claude(path, sample_servers)
         data = json.loads(path.read_text())
         assert "mcpServers" in data
@@ -319,7 +319,7 @@ class TestRoundTrip:
         "tool,writer,reader,filename",
         [
             ("vscode", mcpshare.write_vscode, mcpshare.read_vscode, "mcp.json"),
-            ("claude", mcpshare.write_claude, mcpshare.read_claude, ".mcp.json"),
+            ("claude", mcpshare.write_claude, mcpshare.read_claude, "mcp_servers.json"),
             ("copilot", mcpshare.write_copilot, mcpshare.read_copilot, "mcp-config.json"),
             ("gemini", mcpshare.write_gemini, mcpshare.read_gemini, "settings.json"),
             ("opencode", mcpshare.write_opencode, mcpshare.read_opencode, "opencode.json"),
@@ -466,3 +466,133 @@ class TestTomlFormatting:
         content = path.read_text()
         assert 'model = "gpt-4"' in content
         assert "[mcp_servers.fs]" in content
+
+
+# ---------------------------------------------------------------------------
+# Disable / Enable tests
+# ---------------------------------------------------------------------------
+
+
+class TestDisableEnable:
+    def _setup_master(self, tmp_path, sample_servers):
+        source = str(tmp_path / "master")
+        master = {"mcpServers": sample_servers}
+        mcpshare.save_master(source, master)
+        config = {"source": source, "mode": "merge", "targets": {}}
+        mcpshare.save_config(config)
+        return source
+
+    def test_disable_server(self, tmp_home, tmp_path, sample_servers):
+        source = self._setup_master(tmp_path, sample_servers)
+        args = mcpshare.Disable(server="filesystem")
+        mcpshare.cmd_disable(args)
+        master = mcpshare.load_master(source)
+        assert master["mcpServers"]["filesystem"]["disabled"] is True
+
+    def test_enable_server(self, tmp_home, tmp_path, sample_servers):
+        source = self._setup_master(tmp_path, sample_servers)
+        # First disable, then enable
+        mcpshare.cmd_disable(mcpshare.Disable(server="filesystem"))
+        mcpshare.cmd_enable(mcpshare.Enable(server="filesystem"))
+        master = mcpshare.load_master(source)
+        assert "disabled" not in master["mcpServers"]["filesystem"]
+
+    def test_disable_nonexistent_raises(self, tmp_home, tmp_path, sample_servers):
+        self._setup_master(tmp_path, sample_servers)
+        with pytest.raises(mcpshare.McpShareError, match="Server not found"):
+            mcpshare.cmd_disable(mcpshare.Disable(server="nonexistent"))
+
+    def test_enable_nonexistent_raises(self, tmp_home, tmp_path, sample_servers):
+        self._setup_master(tmp_path, sample_servers)
+        with pytest.raises(mcpshare.McpShareError, match="Server not found"):
+            mcpshare.cmd_enable(mcpshare.Enable(server="nonexistent"))
+
+    def test_disable_idempotent(self, tmp_home, tmp_path, sample_servers):
+        source = self._setup_master(tmp_path, sample_servers)
+        mcpshare.cmd_disable(mcpshare.Disable(server="filesystem"))
+        mcpshare.cmd_disable(mcpshare.Disable(server="filesystem"))
+        master = mcpshare.load_master(source)
+        assert master["mcpServers"]["filesystem"]["disabled"] is True
+
+    def test_enable_idempotent(self, tmp_home, tmp_path, sample_servers):
+        source = self._setup_master(tmp_path, sample_servers)
+        # Enable a server that was never disabled
+        mcpshare.cmd_enable(mcpshare.Enable(server="filesystem"))
+        master = mcpshare.load_master(source)
+        assert "disabled" not in master["mcpServers"]["filesystem"]
+
+
+# ---------------------------------------------------------------------------
+# Disabled field handling in writers
+# ---------------------------------------------------------------------------
+
+
+class TestDisabledFieldInWriters:
+    @pytest.fixture
+    def servers_with_disabled(self, sample_servers):
+        s = dict(sample_servers)
+        s["filesystem"] = dict(s["filesystem"], disabled=True)
+        return s
+
+    def test_write_copilot_preserves_disabled(self, tmp_path, servers_with_disabled):
+        path = tmp_path / "mcp-config.json"
+        mcpshare.write_copilot(path, servers_with_disabled)
+        data = json.loads(path.read_text())
+        assert data["mcpServers"]["filesystem"]["disabled"] is True
+
+    def test_write_claude_preserves_disabled(self, tmp_path, servers_with_disabled):
+        path = tmp_path / "mcp_servers.json"
+        mcpshare.write_claude(path, servers_with_disabled)
+        data = json.loads(path.read_text())
+        assert data["mcpServers"]["filesystem"]["disabled"] is True
+
+    def test_write_vscode_strips_disabled(self, tmp_path, servers_with_disabled):
+        path = tmp_path / "mcp.json"
+        mcpshare.write_vscode(path, servers_with_disabled)
+        data = json.loads(path.read_text())
+        assert "disabled" not in data["servers"]["filesystem"]
+
+    def test_write_codex_strips_disabled(self, tmp_path, servers_with_disabled):
+        path = tmp_path / "config.toml"
+        mcpshare.write_codex(path, servers_with_disabled)
+        content = path.read_text()
+        assert "disabled" not in content
+
+    def test_write_gemini_strips_disabled(self, tmp_path, servers_with_disabled):
+        path = tmp_path / "settings.json"
+        mcpshare.write_gemini(path, servers_with_disabled)
+        data = json.loads(path.read_text())
+        assert "disabled" not in data["mcpServers"]["filesystem"]
+
+    def test_write_opencode_strips_disabled(self, tmp_path, servers_with_disabled):
+        path = tmp_path / "opencode.json"
+        mcpshare.write_opencode(path, servers_with_disabled)
+        data = json.loads(path.read_text())
+        assert "disabled" not in data["mcp"]["filesystem"]
+
+
+# ---------------------------------------------------------------------------
+# Collect preserves disabled flag
+# ---------------------------------------------------------------------------
+
+
+class TestCollectPreservesDisabled:
+    def test_collect_preserves_disabled_flag(self, tmp_path, sample_servers):
+        source = str(tmp_path / "master")
+        disabled_servers = dict(sample_servers)
+        disabled_servers["filesystem"] = dict(disabled_servers["filesystem"], disabled=True)
+        mcpshare.save_master(source, {"mcpServers": disabled_servers})
+
+        # Set up a vscode target that has the same server without disabled
+        vscode_dir = tmp_path / "vscode"
+        vscode_dir.mkdir()
+        vscode_path = vscode_dir / "mcp.json"
+        mcpshare.write_vscode(vscode_path, {"filesystem": sample_servers["filesystem"]})
+
+        config = {
+            "source": source,
+            "mode": "merge",
+            "targets": {"vscode": {"path": str(vscode_dir)}},
+        }
+        master = mcpshare.collect(config)
+        assert master["mcpServers"]["filesystem"]["disabled"] is True

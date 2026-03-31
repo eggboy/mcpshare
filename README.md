@@ -13,7 +13,8 @@ definitions across **VSCode**, **GitHub Copilot CLI**, **Claude Code**,
 ```bash
 # Run directly with PEP 723 inline metadata
 uv run mcpshare.py init   # create default config
-uv run mcpshare.py sync   # synchronize MCP settings
+uv run mcpshare.py update # collect servers from targets into master
+uv run mcpshare.py sync   # distribute master to all targets
 uv run mcpshare.py status # show current state
 ```
 
@@ -25,6 +26,7 @@ uv tool install git+https://github.com/eggboy/mcpshare.git
 
 # Then run from anywhere
 mcpshare init
+mcpshare update
 mcpshare sync
 mcpshare status
 
@@ -64,17 +66,40 @@ targets:
 ## How it works
 
 1. **`mcpshare init`** – creates the config file and master directory.
-2. **`mcpshare sync`** – in *merge* mode, reads MCP server entries from every
-   configured target, merges them into the master `mcp.json`, then converts and
-   writes the result back to each target in its native format.
-3. **`mcpshare status`** – shows the master servers and whether each target
+2. **`mcpshare update`** – reads MCP server entries from every configured
+   target and merges them into the master `mcp.json` (collect only, does not
+   write back to targets).
+3. **`mcpshare sync`** – distributes the master `mcp.json` to all configured
+   targets, converting to each tool's native format.
+4. **`mcpshare status`** – shows the master servers and whether each target
    config file exists.
+
+Typical workflow: `mcpshare update` → `mcpshare sync`.
+
+### Disabling servers
+
+You can disable individual MCP servers without removing them from the master:
+
+```bash
+mcpshare disable <server>   # mark a server as disabled
+mcpshare enable <server>    # re-enable a disabled server
+mcpshare status             # disabled servers show [disabled]
+```
+
+On `mcpshare sync`, each target handles disabled servers differently:
+
+| Target | Behaviour |
+|--------|-----------|
+| Copilot CLI | Writes `"disabled": true` — Copilot natively skips the server |
+| Claude Code | Writes `"disabled": true` — Claude ignores unknown fields; use `--disallowedTools` or `--strict-mcp-config` externally to skip |
+| VSCode | Strips the `disabled` field (VSCode manages enable/disable state in its own UI) |
+| Codex, Gemini, OpenCode | Strips the `disabled` field |
 
 ### Supported formats
 
 | Tool | File | Top-level key | Notes |
 |------|------|---------------|-------|
-| Claude Code | `.mcp.json` | `mcpServers` | |
+| Claude Code | `mcp_servers.json` | `mcpServers` | |
 | VSCode | `mcp.json` | `servers` | Adds `"type": "stdio"` |
 | Copilot CLI | `mcp-config.json` | `mcpServers` | Adds `"type": "stdio"` |
 | Codex | `config.toml` | `[mcp_servers.*]` | TOML format |

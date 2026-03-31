@@ -12,13 +12,21 @@ Supports VSCode, Claude Code, GitHub Copilot CLI, OpenAI Codex,
 Google Gemini CLI, and OpenCode.
 """
 
+import importlib.metadata
 import json
 import logging
 import os
+import re
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Union
+
+try:
+    __version__ = importlib.metadata.version("mcpshare")
+except importlib.metadata.PackageNotFoundError:
+    __version__ = "0.5.0"
 
 import tyro
 import yaml
@@ -41,6 +49,7 @@ class ConfigParseError(McpShareError, ValueError):
 CONFIG_DIR = Path.home() / ".config" / "mcpshare"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 MASTER_FILENAME = "mcp.json"
+MASTER_BACKUP_FILENAME = "mcp.json.bak"
 
 
 def _vscode_config_dir() -> Path:
@@ -55,7 +64,7 @@ def _vscode_config_dir() -> Path:
 
 # Default config locations for each tool (user-level)
 DEFAULT_CONFIG_PATHS = {
-    "claude": Path.home() / ".claude" / "settings.json",
+    "claude": Path.home() / ".claude" / "mcp_servers.json",
     "vscode": _vscode_config_dir() / "mcp.json",
     "copilot": Path.home() / ".copilot" / "mcp-config.json",
     "codex": Path.home() / ".codex" / "config.toml",
@@ -65,7 +74,7 @@ DEFAULT_CONFIG_PATHS = {
 
 # Output filenames when writing to target directories
 TARGET_FILENAMES = {
-    "claude": ".mcp.json",
+    "claude": "mcp_servers.json",
     "vscode": "mcp.json",
     "copilot": "mcp-config.json",
     "codex": "config.toml",
@@ -133,6 +142,13 @@ def load_master(source_dir: str) -> dict[str, Any]:
         raise ConfigParseError(f"Invalid JSON in {master_path}: {exc}") from exc
     if "mcpServers" not in data:
         data["mcpServers"] = {}
+    # Normalize any multi-word command strings so the executable is separated
+    # from its flags/arguments (e.g. "npx -y @azure/mcp@latest" → "npx").
+    for cfg in data["mcpServers"].values():
+        if "command" in cfg and " " in cfg["command"]:
+            parts = cfg["command"].split()
+            cfg["command"] = parts[0]
+            cfg["args"] = parts[1:] + list(cfg.get("args", []))
     return data
 
 
@@ -167,6 +183,12 @@ def read_vscode(path: Path) -> dict[str, Any]:
     for name, cfg in servers.items():
         safe_name = name.replace(" ", "_")
         entry = {k: v for k, v in cfg.items() if k != "type"}
+        # Normalize command: split multi-word command strings so that only
+        # the executable lands in "command" and the rest is prepended to "args".
+        if "command" in entry and " " in entry["command"]:
+            parts = entry["command"].split()
+            entry["command"] = parts[0]
+            entry["args"] = parts[1:] + list(entry.get("args", []))
         result[safe_name] = entry
     return result
 
@@ -360,12 +382,28 @@ def _server_type(cfg: dict[str, Any]) -> str:
     return "http" if "url" in cfg else "stdio"
 
 
-def write_vscode(path: Path, servers: dict[str, Any]) -> None:
+_VSCODE_ENV_RE = re.compile(r"\$\{env:(\w+)\}")
+
+
+def _resolve_vscode_vars(value: object) -> object:
+    """Recursively resolve VSCode ``${env:VAR}`` placeholders to real env values."""
+    if isinstance(value, str):
+        return _VSCODE_ENV_RE.sub(lambda m: os.environ.get(m.group(1), m.group(0)), value)
+    if isinstance(value, list):
+        return [_resolve_vscode_vars(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _resolve_vscode_vars(v) for k, v in value.items()}
+    return value
+
+
+def write_vscode(path: Path, servers: dict[str, Any]) -> int:
     """Write MCP servers in VSCode format.
 
     Produces ``{"servers": {"name": {"type": "stdio"|"http", ...}}}``.
     The type is determined by the server configuration: ``"http"`` for
     URL-based servers and ``"stdio"`` for command-based servers.
+
+    Returns the number of servers written.
     """
     existing = {}
     if path.exists():
@@ -374,19 +412,22 @@ def write_vscode(path: Path, servers: dict[str, Any]) -> None:
     vscode_servers = {}
     for name, cfg in servers.items():
         entry = {"type": _server_type(cfg)}
-        entry.update(cfg)
+        entry.update({k: v for k, v in cfg.items() if k != "disabled"})
         vscode_servers[name] = entry
     existing["servers"] = vscode_servers
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(existing, f, indent=2)
         f.write("\n")
+    return len(vscode_servers), []
 
 
-def write_claude(path: Path, servers: dict[str, Any]) -> None:
+def write_claude(path: Path, servers: dict[str, Any]) -> int:
     """Write MCP servers in Claude Code format.
 
     Produces ``{"mcpServers": {"name": {"command": ...}}}``.
+
+    Returns the number of servers written.
     """
     existing = {}
     if path.exists():
@@ -397,21 +438,30 @@ def write_claude(path: Path, servers: dict[str, Any]) -> None:
     with open(path, "w") as f:
         json.dump(existing, f, indent=2)
         f.write("\n")
+    return len(servers), []
 
 
-def write_copilot(path: Path, servers: dict[str, Any]) -> None:
+def write_copilot(path: Path, servers: dict[str, Any]) -> int:
     """Write MCP servers in Copilot CLI format.
 
     Produces ``{"mcpServers": {"name": {"type": "stdio"|"http", ...}}}``.
     The type is determined by the server configuration: ``"http"`` for
     URL-based servers and ``"stdio"`` for command-based servers.
+
+    Returns the number of servers written.
     """
     existing = {}
     if path.exists():
         with open(path) as f:
             existing = json.load(f)
+    # Copilot CLI ships with its own GitHub MCP server, so skip any entry
+    # pointing at the built-in endpoint (but keep github_spaces and others).
     copilot_servers = {}
+    skipped: list[str] = []
     for name, cfg in servers.items():
+        if cfg.get("url") == "https://api.githubcopilot.com/mcp":
+            skipped.append(f"{name} (built-in)")
+            continue
         entry = {"type": _server_type(cfg)}
         entry.update(cfg)
         copilot_servers[name] = entry
@@ -420,6 +470,7 @@ def write_copilot(path: Path, servers: dict[str, Any]) -> None:
     with open(path, "w") as f:
         json.dump(existing, f, indent=2)
         f.write("\n")
+    return len(copilot_servers), skipped
 
 
 def _format_toml_value(value: object) -> str:
@@ -448,12 +499,14 @@ def _toml_key(name: str) -> str:
     return name
 
 
-def write_codex(path: Path, servers: dict[str, Any]) -> None:
+def write_codex(path: Path, servers: dict[str, Any]) -> int:
     """Write MCP servers in Codex TOML format.
 
     Produces ``[mcp_servers.<name>]`` sections.  Server names containing
     dots or spaces are quoted to prevent TOML from treating them as nested
     tables.  Non-MCP content in an existing file is preserved.
+
+    Returns the number of servers written.
     """
     existing_lines: list[str] = []
     if path.exists():
@@ -477,37 +530,45 @@ def write_codex(path: Path, servers: dict[str, Any]) -> None:
         parts.append("")
         parts.append(f"[mcp_servers.{_toml_key(name)}]")
         for key, val in cfg.items():
+            if key == "disabled":
+                continue
             parts.append(f"{key} = {_format_toml_value(val)}")
     parts.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(parts))
+    return len(servers), []
 
 
-def write_gemini(path: Path, servers: dict[str, Any]) -> None:
+def write_gemini(path: Path, servers: dict[str, Any]) -> int:
     """Write MCP servers in Gemini CLI format.
 
     Produces ``{"mcpServers": {"name": {"command": ...}}}``.
     Preserves existing non-MCP settings.
+
+    Returns the number of servers written.
     """
     existing = {}
     if path.exists():
         with open(path) as f:
             existing = json.load(f)
-    existing["mcpServers"] = servers
+    existing["mcpServers"] = {name: {k: v for k, v in cfg.items() if k != "disabled"} for name, cfg in servers.items()}
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(existing, f, indent=2)
         f.write("\n")
+    return len(servers), []
 
 
-def write_opencode(path: Path, servers: dict[str, Any]) -> None:
+def write_opencode(path: Path, servers: dict[str, Any]) -> int:
     """Write MCP servers in OpenCode format.
 
     For stdio servers, converts ``command``/``args`` to a single ``command``
     list, ``env`` to ``environment``, and adds ``"type": "local"``.
     For HTTP/SSE servers (those with ``url``), uses ``"type": "remote"``
     with a ``url`` field.  Preserves existing non-MCP settings.
+
+    Returns the number of servers written.
     """
     existing = {}
     if path.exists():
@@ -534,6 +595,7 @@ def write_opencode(path: Path, servers: dict[str, Any]) -> None:
     with open(path, "w") as f:
         json.dump(existing, f, indent=2)
         f.write("\n")
+    return len(oc_servers), []
 
 
 WRITERS = {
@@ -554,11 +616,17 @@ def resolve_target_path(tool: str, target_dir: str) -> Path:
 def collect(config: dict[str, Any]) -> dict[str, Any]:
     """Read MCP servers from all configured targets and merge into master.
 
+    Disabled flags from the existing master are preserved even when a target
+    provides the same server without the flag.
+
     Returns the merged master dict.
     """
     source_dir = config["source"]
     master = load_master(source_dir)
     servers = dict(master.get("mcpServers", {}))
+
+    # Remember which servers were disabled before merging.
+    disabled_servers = {name for name, cfg in servers.items() if cfg.get("disabled")}
 
     targets = config.get("targets", {})
     for tool, tcfg in targets.items():
@@ -570,6 +638,11 @@ def collect(config: dict[str, Any]) -> dict[str, Any]:
         if tool_servers:
             logger.info("Collected %d server(s) from %s", len(tool_servers), tool)
             servers.update(tool_servers)
+
+    # Re-apply disabled flags that were present in the master.
+    for name in disabled_servers:
+        if name in servers:
+            servers[name]["disabled"] = True
 
     master["mcpServers"] = servers
     return master
@@ -584,8 +657,12 @@ def distribute(config: dict[str, Any], master: dict[str, Any]) -> None:
             logger.warning("Skipping unknown tool: %s", tool)
             continue
         target_path = resolve_target_path(tool, tcfg["path"])
-        WRITERS[tool](target_path, servers)
-        logger.info("Wrote %d server(s) to %s (%s)", len(servers), tool, target_path)
+        # VSCode handles ${env:VAR} natively; resolve for all other targets.
+        tool_servers = servers if tool == "vscode" else _resolve_vscode_vars(servers)
+        count, skipped = WRITERS[tool](target_path, tool_servers)
+        logger.info("Wrote %d server(s) to %s (%s)", count, tool, target_path)
+        for reason in skipped:
+            logger.info("\033[31m  ↳ skipped %s\033[0m", reason)
 
 
 # ---------------------------------------------------------------------------
@@ -618,11 +695,29 @@ class Status:
     """Show current config status."""
 
 
+@dataclass
+class Disable:
+    """Disable an MCP server in the master config."""
+
+    server: str
+    """Name of the server to disable."""
+
+
+@dataclass
+class Enable:
+    """Enable a previously disabled MCP server."""
+
+    server: str
+    """Name of the server to enable."""
+
+
 Command = Union[
     Annotated[Init, tyro.conf.subcommand("init")],
     Annotated[Update, tyro.conf.subcommand("update")],
     Annotated[Sync, tyro.conf.subcommand("sync")],
     Annotated[Status, tyro.conf.subcommand("status")],
+    Annotated[Disable, tyro.conf.subcommand("disable")],
+    Annotated[Enable, tyro.conf.subcommand("enable")],
 ]
 
 
@@ -655,6 +750,12 @@ def cmd_init(args: Init) -> None:
 def cmd_update(args: Update) -> None:
     """Collect MCP servers from all targets into master."""
     config = load_config()
+    # Back up the current master before overwriting.
+    master_path = Path(config["source"]) / MASTER_FILENAME
+    if master_path.exists():
+        backup_path = Path(config["source"]) / MASTER_BACKUP_FILENAME
+        shutil.copy2(master_path, backup_path)
+        logger.info("Backed up master to %s", backup_path)
     logger.info("Collecting MCP servers from targets...")
     master = collect(config)
     save_master(config["source"], master)
@@ -686,7 +787,8 @@ def cmd_status(args: Status) -> None:
     for name in sorted(servers):
         cfg = servers[name]
         transport = cfg["url"] if "url" in cfg else cfg.get("command", "?")
-        print(f"  - {name}: {transport}")
+        disabled = " [disabled]" if cfg.get("disabled") else ""
+        print(f"  - {name}: {transport}{disabled}")
 
     print("\nTargets:")
     targets = config.get("targets", {})
@@ -696,12 +798,41 @@ def cmd_status(args: Status) -> None:
         print(f"  {exists} {tool}: {target_path}")
 
 
+def cmd_disable(args: Disable) -> None:
+    """Disable an MCP server in the master config."""
+    config = load_config()
+    master = load_master(config["source"])
+    servers = master.get("mcpServers", {})
+    if args.server not in servers:
+        raise McpShareError(f"Server not found: {args.server}")
+    servers[args.server]["disabled"] = True
+    save_master(config["source"], master)
+    print(f"Disabled: {args.server}")
+
+
+def cmd_enable(args: Enable) -> None:
+    """Enable a previously disabled MCP server."""
+    config = load_config()
+    master = load_master(config["source"])
+    servers = master.get("mcpServers", {})
+    if args.server not in servers:
+        raise McpShareError(f"Server not found: {args.server}")
+    servers[args.server].pop("disabled", None)
+    save_master(config["source"], master)
+    print(f"Enabled: {args.server}")
+
+
 def main() -> None:
     """CLI entry point."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
     )
+
+    # Handle --version / -v before tyro parses subcommands.
+    if len(sys.argv) == 2 and sys.argv[1] in ("--version", "-v"):
+        print(f"mcpshare {__version__}")
+        return
 
     cmd = tyro.cli(Command, prog="mcpshare", description="Synchronize MCP configurations between coding agents.")
 
@@ -714,6 +845,10 @@ def main() -> None:
             cmd_sync(cmd)
         elif isinstance(cmd, Status):
             cmd_status(cmd)
+        elif isinstance(cmd, Disable):
+            cmd_disable(cmd)
+        elif isinstance(cmd, Enable):
+            cmd_enable(cmd)
     except McpShareError as exc:
         logger.error("%s", exc)
         sys.exit(1)
