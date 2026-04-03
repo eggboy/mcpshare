@@ -13,7 +13,7 @@ definitions across **VSCode**, **GitHub Copilot CLI**, **Claude Code**,
 ```bash
 # Run directly with PEP 723 inline metadata
 uv run mcpshare.py init   # create default config
-uv run mcpshare.py update # collect servers from targets into master
+uv run mcpshare.py pull   # pull servers from targets into master
 uv run mcpshare.py sync   # distribute master to all targets
 uv run mcpshare.py status # show current state
 ```
@@ -26,7 +26,7 @@ uv tool install git+https://github.com/eggboy/mcpshare.git
 
 # Then run from anywhere
 mcpshare init
-mcpshare update
+mcpshare pull
 mcpshare sync
 mcpshare status
 
@@ -66,7 +66,7 @@ targets:
 ## How it works
 
 1. **`mcpshare init`** – creates the config file and master directory.
-2. **`mcpshare update`** – reads MCP server entries from every configured
+2. **`mcpshare pull`** – pulls MCP server entries from every configured
    target and merges them into the master `mcp.json` (collect only, does not
    write back to targets).
 3. **`mcpshare sync`** – distributes the master `mcp.json` to all configured
@@ -74,7 +74,7 @@ targets:
 4. **`mcpshare status`** – shows the master servers and whether each target
    config file exists.
 
-Typical workflow: `mcpshare update` → `mcpshare sync`.
+Typical workflow: `mcpshare pull` → `mcpshare sync`.
 
 ### Disabling servers
 

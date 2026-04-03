@@ -114,8 +114,8 @@ class TestReaders:
         }
         path.write_text(json.dumps(data))
         result = mcpshare.read_vscode(path)
-        assert "my_server" in result
-        assert "another_tool" in result
+        assert "my-server" in result
+        assert "another-tool" in result
         assert "my server" not in result
         assert "another tool" not in result
 
@@ -484,7 +484,7 @@ class TestDisableEnable:
 
     def test_disable_server(self, tmp_home, tmp_path, sample_servers):
         source = self._setup_master(tmp_path, sample_servers)
-        args = mcpshare.Disable(server="filesystem")
+        args = mcpshare.Disable(servers=("filesystem",))
         mcpshare.cmd_disable(args)
         master = mcpshare.load_master(source)
         assert master["mcpServers"]["filesystem"]["disabled"] is True
@@ -492,32 +492,32 @@ class TestDisableEnable:
     def test_enable_server(self, tmp_home, tmp_path, sample_servers):
         source = self._setup_master(tmp_path, sample_servers)
         # First disable, then enable
-        mcpshare.cmd_disable(mcpshare.Disable(server="filesystem"))
-        mcpshare.cmd_enable(mcpshare.Enable(server="filesystem"))
+        mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",)))
+        mcpshare.cmd_enable(mcpshare.Enable(servers=("filesystem",)))
         master = mcpshare.load_master(source)
         assert "disabled" not in master["mcpServers"]["filesystem"]
 
     def test_disable_nonexistent_raises(self, tmp_home, tmp_path, sample_servers):
         self._setup_master(tmp_path, sample_servers)
         with pytest.raises(mcpshare.McpShareError, match="Server not found"):
-            mcpshare.cmd_disable(mcpshare.Disable(server="nonexistent"))
+            mcpshare.cmd_disable(mcpshare.Disable(servers=("nonexistent",)))
 
     def test_enable_nonexistent_raises(self, tmp_home, tmp_path, sample_servers):
         self._setup_master(tmp_path, sample_servers)
         with pytest.raises(mcpshare.McpShareError, match="Server not found"):
-            mcpshare.cmd_enable(mcpshare.Enable(server="nonexistent"))
+            mcpshare.cmd_enable(mcpshare.Enable(servers=("nonexistent",)))
 
     def test_disable_idempotent(self, tmp_home, tmp_path, sample_servers):
         source = self._setup_master(tmp_path, sample_servers)
-        mcpshare.cmd_disable(mcpshare.Disable(server="filesystem"))
-        mcpshare.cmd_disable(mcpshare.Disable(server="filesystem"))
+        mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",)))
+        mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",)))
         master = mcpshare.load_master(source)
         assert master["mcpServers"]["filesystem"]["disabled"] is True
 
     def test_enable_idempotent(self, tmp_home, tmp_path, sample_servers):
         source = self._setup_master(tmp_path, sample_servers)
         # Enable a server that was never disabled
-        mcpshare.cmd_enable(mcpshare.Enable(server="filesystem"))
+        mcpshare.cmd_enable(mcpshare.Enable(servers=("filesystem",)))
         master = mcpshare.load_master(source)
         assert "disabled" not in master["mcpServers"]["filesystem"]
 
@@ -596,3 +596,47 @@ class TestCollectPreservesDisabled:
         }
         master = mcpshare.collect(config)
         assert master["mcpServers"]["filesystem"]["disabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# Server ID sanitization and validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeServerId:
+    @pytest.mark.parametrize(
+        "input_name,expected",
+        [
+            ("my server", "my-server"),
+            ("My_Server", "my-server"),
+            ("UPPER_CASE", "upper-case"),
+            ("already-kebab", "already-kebab"),
+            ("  leading spaces  ", "leading-spaces"),
+            ("double__underscore", "double-underscore"),
+            ("mixed - _ stuff", "mixed-stuff"),
+        ],
+    )
+    def test_sanitize_server_id(self, input_name, expected):
+        assert mcpshare._sanitize_server_id(input_name) == expected
+
+
+class TestValidateServerId:
+    def test_valid_kebab_with_mcp(self):
+        assert mcpshare._validate_server_id("epic-stuff-mcp") == []
+
+    def test_valid_mcp_prefix(self):
+        assert mcpshare._validate_server_id("mcp-filesystem") == []
+
+    def test_missing_mcp(self):
+        warnings = mcpshare._validate_server_id("filesystem")
+        assert len(warnings) == 1
+        assert "does not contain 'mcp'" in warnings[0]
+
+    def test_not_kebab_case(self):
+        warnings = mcpshare._validate_server_id("My_Server")
+        assert any("not kebab-case" in w for w in warnings)
+
+    def test_dotted_name_skips_kebab_check(self):
+        """Dotted names (e.g. TOML nested keys) skip the kebab-case check."""
+        warnings = mcpshare._validate_server_id("microsoft.docs.mcp")
+        assert not any("not kebab-case" in w for w in warnings)
