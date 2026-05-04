@@ -1,51 +1,51 @@
 # mcpshare
 
-CLI tool to share MCP configuration between coding agents.
+コーディングエージェント間で MCP 設定を共有するための CLI ツールです。
 
-Synchronizes [Model Context Protocol](https://modelcontextprotocol.io/) server
-definitions across **VSCode**, **GitHub Copilot CLI**, **Claude Code**,
-**OpenAI Codex**, **Google Gemini CLI**, and **OpenCode**.
+[Model Context Protocol](https://modelcontextprotocol.io/) サーバー定義を
+**VSCode**、**GitHub Copilot CLI**、**Claude Code**、**OpenAI Codex**、
+**Google Gemini CLI**、**OpenCode** 間で同期します。
 
-## Quick start
+## クイックスタート
 
-### With `uv` (recommended)
+### `uv` を使う場合（推奨）
 
 ```bash
-# Run directly with PEP 723 inline metadata
-uv run mcpshare.py init   # create default config
-uv run mcpshare.py pull   # pull servers from targets into master
-uv run mcpshare.py sync   # distribute master to all targets
-uv run mcpshare.py status # show current state
+# PEP 723 のインラインメタデータで直接実行
+uv run mcpshare.py init   # デフォルト設定を作成
+uv run mcpshare.py pull   # 各ターゲットから master にサーバーを収集
+uv run mcpshare.py sync   # master をすべてのターゲットへ配布
+uv run mcpshare.py status # 現在の状態を表示
 ```
 
-### With `uv tool install`
+### `uv tool install` を使う場合
 
 ```bash
-# Install as a global CLI tool
+# グローバル CLI ツールとしてインストール
 uv tool install git+https://github.com/eggboy/mcpshare.git
 
-# Then run from anywhere
+# 以降はどこからでも実行可能
 mcpshare init
 mcpshare pull
 mcpshare sync
 mcpshare status
 
-# Upgrade to the latest version
+# 最新バージョンへ更新
 uv tool upgrade mcpshare
 ```
 
-## Configuration
+## 設定
 
-The config file lives at `~/.config/mcpshare/config.yaml`:
+設定ファイルは `~/.config/mcpshare/config.yaml` にあります:
 
 ```yaml
-source: /path/to/master          # directory for the canonical mcp.json
+source: /path/to/master          # 正本 mcp.json を置くディレクトリ
 mode: merge                      # merge | overwrite
 targets:
   claude:
     path: ~/.claude
   vscode:
-    path: ~/Library/Application Support/Code/User  # macOS; see docs for other OS
+    path: ~/Library/Application Support/Code/User  # macOS。その他 OS は docs を参照
   copilot:
     path: ~/.copilot
   codex:
@@ -56,62 +56,59 @@ targets:
     path: ~/.config/opencode
 ```
 
-### Modes
+### モード
 
-| Mode | Behaviour |
+| モード | 挙動 |
 |------|-----------|
-| `merge` | Collect servers from every target first, merge into master, then distribute |
-| `overwrite` | Use the master as the single source of truth and overwrite all targets |
+| `merge` | まずすべてのターゲットからサーバーを収集して master にマージし、その後配布 |
+| `overwrite` | master を唯一の正とし、すべてのターゲットを上書き |
 
-## How it works
+## 動作概要
 
-1. **`mcpshare init`** – creates the config file and master directory.
-2. **`mcpshare pull`** – pulls MCP server entries from every configured
-   target and merges them into the master `mcp.json` (collect only, does not
-   write back to targets).
-3. **`mcpshare sync`** – distributes the master `mcp.json` to all configured
-   targets, converting to each tool's native format.
-4. **`mcpshare status`** – shows the master servers and whether each target
-   config file exists.
+1. **`mcpshare init`** – 設定ファイルと master ディレクトリを作成します。
+2. **`mcpshare pull`** – 設定された各ターゲットから MCP サーバー定義を取得し、
+   master の `mcp.json` にマージします（収集のみで、ターゲットへは書き戻しません）。
+3. **`mcpshare sync`** – master の `mcp.json` を設定済みの全ターゲットに配布し、
+   各ツールのネイティブ形式へ変換します。
+4. **`mcpshare status`** – master のサーバー一覧と、各ターゲット設定ファイルの存在有無を表示します。
 
-Typical workflow: `mcpshare pull` → `mcpshare sync`.
+典型的なワークフロー: `mcpshare pull` → `mcpshare sync`。
 
-### Disabling servers
+### サーバーの無効化
 
-You can disable individual MCP servers without removing them from the master:
+master から削除せずに、個別の MCP サーバーを無効化できます:
 
 ```bash
-mcpshare disable <server>   # mark a server as disabled
-mcpshare enable <server>    # re-enable a disabled server
-mcpshare status             # disabled servers show [disabled]
+mcpshare disable <server>   # サーバーを無効としてマーク
+mcpshare enable <server>    # 無効化したサーバーを再有効化
+mcpshare status             # 無効なサーバーは [disabled] と表示
 ```
 
-On `mcpshare sync`, each target handles disabled servers differently:
+`mcpshare sync` 時の無効化サーバーの扱いはターゲットごとに異なります:
 
-| Target | Behaviour |
+| ターゲット | 挙動 |
 |--------|-----------|
-| Copilot CLI | Writes `"disabled": true` — Copilot natively skips the server |
-| Claude Code | Writes `"disabled": true` — Claude ignores unknown fields; use `--disallowedTools` or `--strict-mcp-config` externally to skip |
-| VSCode | Strips the `disabled` field (VSCode manages enable/disable state in its own UI) |
-| Codex | Writes `enabled = false` — Codex lists the server but does not load its tools |
-| Gemini, OpenCode | Strips the `disabled` field |
+| Copilot CLI | `"disabled": true` を書き込み — Copilot はこのサーバーをネイティブにスキップ |
+| Claude Code | `"disabled": true` を書き込み — Claude は未知のフィールドを無視。スキップには外部で `--disallowedTools` または `--strict-mcp-config` を利用 |
+| VSCode | `disabled` フィールドを除去（有効/無効は VSCode 側 UI で管理） |
+| Codex | `enabled = false` を書き込み — サーバーは表示されるがツールは読み込まれない |
+| Gemini, OpenCode | `disabled` フィールドを除去 |
 
-### Supported formats
+### 対応フォーマット
 
-| Tool | File | Top-level key | Notes |
+| ツール | ファイル | 最上位キー | 備考 |
 |------|------|---------------|-------|
 | Claude Code | `mcp_servers.json` | `mcpServers` | |
-| VSCode | `mcp.json` | `servers` | Adds `"type": "stdio"` |
-| Copilot CLI | `mcp-config.json` | `mcpServers` | Adds `"type": "stdio"` |
-| Codex | `config.toml` | `[mcp_servers.*]` | TOML format |
-| Gemini CLI | `settings.json` | `mcpServers` | Preserves non-MCP settings |
-| OpenCode | `opencode.json` | `mcp` | Uses `command` array, `environment` |
+| VSCode | `mcp.json` | `servers` | `"type": "stdio"` を追加 |
+| Copilot CLI | `mcp-config.json` | `mcpServers` | `"type": "stdio"` を追加 |
+| Codex | `config.toml` | `[mcp_servers.*]` | TOML 形式 |
+| Gemini CLI | `settings.json` | `mcpServers` | MCP 以外の設定を保持 |
+| OpenCode | `opencode.json` | `mcp` | `command` 配列、`environment` を使用 |
 
-## Development
+## 開発
 
 ```bash
 pip install -e .
 pip install pytest
 python -m pytest tests/ -v
 ```
-
