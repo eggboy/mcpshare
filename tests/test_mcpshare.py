@@ -557,6 +557,31 @@ class TestDisabledFieldInWriters:
         mcpshare.write_codex(path, servers_with_disabled)
         content = path.read_text()
         assert "disabled" not in content
+        assert "enabled = false" in content
+
+    def test_write_codex_converts_tools_list_to_map(self, tmp_path):
+        """Codex expects tools as a TOML map, not an array."""
+        path = tmp_path / "config.toml"
+        servers = {"azure-mcp": {"command": "npx", "args": ["-y", "@azure/mcp@latest"], "tools": ["*"]}}
+        mcpshare.write_codex(path, servers)
+        content = path.read_text()
+        assert 'tools = { "*" = { enabled = true } }' in content
+        assert 'tools = ["*"]' not in content
+
+    def test_read_codex_translates_enabled_false(self, tmp_path):
+        """read_codex converts Codex 'enabled = false' to canonical 'disabled = true'."""
+        path = tmp_path / "config.toml"
+        path.write_text('[mcp_servers.test-mcp]\ncommand = "echo"\nargs = []\nenabled = false\n')
+        result = mcpshare.read_codex(path)
+        assert result["test-mcp"]["disabled"] is True
+        assert "enabled" not in result["test-mcp"]
+
+    def test_read_codex_tools_map_to_list(self, tmp_path):
+        """read_codex converts Codex tools map back to canonical list."""
+        path = tmp_path / "config.toml"
+        path.write_text('[mcp_servers.test-mcp]\ncommand = "echo"\nargs = []\n\n[mcp_servers.test-mcp.tools]\n"*" = {}\n')
+        result = mcpshare.read_codex(path)
+        assert result["test-mcp"]["tools"] == ["*"]
 
     def test_write_gemini_strips_disabled(self, tmp_path, servers_with_disabled):
         path = tmp_path / "settings.json"

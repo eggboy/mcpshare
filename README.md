@@ -93,7 +93,8 @@ On `mcpshare sync`, each target handles disabled servers differently:
 | Copilot CLI | Writes `"disabled": true` — Copilot natively skips the server |
 | Claude Code | Writes `"disabled": true` — Claude ignores unknown fields; use `--disallowedTools` or `--strict-mcp-config` externally to skip |
 | VSCode | Strips the `disabled` field (VSCode manages enable/disable state in its own UI) |
-| Codex, Gemini, OpenCode | Strips the `disabled` field |
+| Codex | Writes `enabled = false` — Codex lists the server but does not load its tools |
+| Gemini, OpenCode | Strips the `disabled` field |
 
 ### Supported formats
 

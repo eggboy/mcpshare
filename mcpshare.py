@@ -296,11 +296,22 @@ def read_codex(path: Path) -> dict[str, Any]:
     """Read MCP servers from Codex config.toml.
 
     Codex uses TOML with ``[mcp_servers.<name>]`` sections.
+    Translates Codex ``enabled = false`` to ``disabled = true`` for the
+    canonical format, and converts ``tools`` maps back to lists.
     """
     if not path.exists():
         return {}
     text = path.read_text()
-    return _parse_toml_mcp_servers(text)
+    servers = _parse_toml_mcp_servers(text)
+    for cfg in servers.values():
+        # Codex 'enabled = false' → canonical 'disabled = true'
+        if cfg.pop("enabled", None) is False:
+            cfg["disabled"] = True
+        # Codex 'tools' is a map; canonical format uses a list
+        tools = cfg.get("tools")
+        if isinstance(tools, dict):
+            cfg["tools"] = list(tools.keys())
+    return servers
 
 
 def read_gemini(path: Path) -> dict[str, Any]:
@@ -472,16 +483,19 @@ def _format_toml_value(value: object) -> str:
     if isinstance(value, dict):
         if not value:
             return "{}"
-        pairs = ", ".join(f"{k} = {_format_toml_value(v)}" for k, v in value.items())
+        pairs = ", ".join(f"{_toml_key(k)} = {_format_toml_value(v)}" for k, v in value.items())
         return f"{{ {pairs} }}"
     return str(value)
 
 
+_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 def _toml_key(name: str) -> str:
-    """Return a TOML-safe key, quoting if it contains dots or spaces."""
-    if "." in name or " " in name:
-        return f'"{name}"'
-    return name
+    """Return a TOML-safe key, quoting if not a valid bare key."""
+    if _BARE_KEY_RE.match(name):
+        return name
+    return f'"{name}"'
 
 
 def write_codex(path: Path, servers: dict[str, Any]) -> tuple[int, list[str]]:
@@ -514,9 +528,15 @@ def write_codex(path: Path, servers: dict[str, Any]) -> tuple[int, list[str]]:
     for name, cfg in servers.items():
         parts.append("")
         parts.append(f"[mcp_servers.{_toml_key(name)}]")
+        # Codex uses 'enabled = false' instead of 'disabled = true'.
+        if cfg.get("disabled"):
+            parts.append("enabled = false")
         for key, val in cfg.items():
             if key == "disabled":
                 continue
+            # Codex expects 'tools' as a map of {name: McpServerToolConfig}
+            if key == "tools" and isinstance(val, list):
+                val = {item: {"enabled": True} for item in val}
             parts.append(f"{key} = {_format_toml_value(val)}")
     parts.append("")
 
