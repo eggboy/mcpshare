@@ -366,7 +366,7 @@ def read_opencode(path: Path) -> dict[str, Any]:
 READERS = {
     # "claude": read_claude,
     "vscode": read_vscode,
-    # "copilot": read_copilot,
+    "copilot": read_copilot,
     # "codex": read_codex,
     # "gemini": read_gemini,
     # "opencode": read_opencode,
