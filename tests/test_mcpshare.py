@@ -474,52 +474,89 @@ class TestTomlFormatting:
 
 
 class TestDisableEnable:
-    def _setup_master(self, tmp_path, sample_servers):
+    def _setup_master(self, tmp_path, sample_servers, *, with_targets=False):
         source = str(tmp_path / "master")
         master = {"mcpServers": sample_servers}
         mcpshare.save_master(source, master)
-        config = {"source": source, "mode": "merge", "targets": {}}
+        targets = {}
+        if with_targets:
+            for tool in ("vscode", "claude"):
+                tdir = tmp_path / tool
+                tdir.mkdir(exist_ok=True)
+                targets[tool] = {"path": str(tdir)}
+        config = {"source": source, "mode": "merge", "targets": targets}
         mcpshare.save_config(config)
         return source
 
-    def test_disable_server(self, tmp_home, tmp_path, sample_servers):
+    def test_disable_server_writes_disabled_yaml(self, tmp_home, tmp_path, sample_servers):
         source = self._setup_master(tmp_path, sample_servers)
-        args = mcpshare.Disable(servers=("filesystem",))
-        mcpshare.cmd_disable(args)
-        master = mcpshare.load_master(source)
-        assert master["mcpServers"]["filesystem"]["disabled"] is True
+        mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",)))
+        data = mcpshare.load_disabled(source)
+        assert data == {"*": ["filesystem"]}
 
-    def test_enable_server(self, tmp_home, tmp_path, sample_servers):
+    def test_disable_per_ide(self, tmp_home, tmp_path, sample_servers):
+        source = self._setup_master(tmp_path, sample_servers, with_targets=True)
+        mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",), ide="vscode"))
+        data = mcpshare.load_disabled(source)
+        assert data == {"vscode": ["filesystem"]}
+
+    def test_disable_unknown_ide_raises(self, tmp_home, tmp_path, sample_servers):
+        self._setup_master(tmp_path, sample_servers, with_targets=True)
+        with pytest.raises(mcpshare.McpShareError, match="Unknown IDE"):
+            mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",), ide="emacs"))
+
+    def test_disable_vscode_warns(self, tmp_home, tmp_path, sample_servers, caplog):
+        """VSCode has no JSON disable mechanism — disable should still record but warn."""
+        source = self._setup_master(tmp_path, sample_servers, with_targets=True)
+        with caplog.at_level("WARNING"):
+            mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",), ide="vscode"))
+        assert "no JSON disable mechanism" in caplog.text
+        assert mcpshare.load_disabled(source) == {"vscode": ["filesystem"]}
+
+    def test_enable_clears_global(self, tmp_home, tmp_path, sample_servers):
         source = self._setup_master(tmp_path, sample_servers)
-        # First disable, then enable
         mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",)))
         mcpshare.cmd_enable(mcpshare.Enable(servers=("filesystem",)))
-        master = mcpshare.load_master(source)
-        assert "disabled" not in master["mcpServers"]["filesystem"]
+        assert mcpshare.load_disabled(source) == {}
 
-    def test_disable_nonexistent_raises(self, tmp_home, tmp_path, sample_servers):
-        self._setup_master(tmp_path, sample_servers)
-        with pytest.raises(mcpshare.McpShareError, match="Server not found"):
+    def test_enable_clears_only_specified_ide(self, tmp_home, tmp_path, sample_servers):
+        source = self._setup_master(tmp_path, sample_servers, with_targets=True)
+        mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",), ide="vscode"))
+        mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",), ide="claude"))
+        mcpshare.cmd_enable(mcpshare.Enable(servers=("filesystem",), ide="vscode"))
+        data = mcpshare.load_disabled(source)
+        assert data == {"claude": ["filesystem"]}
+
+    def test_enable_without_ide_clears_everywhere(self, tmp_home, tmp_path, sample_servers):
+        source = self._setup_master(tmp_path, sample_servers, with_targets=True)
+        mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",)))
+        mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",), ide="vscode"))
+        mcpshare.cmd_enable(mcpshare.Enable(servers=("filesystem",)))
+        assert mcpshare.load_disabled(source) == {}
+
+    def test_disable_nonexistent_warns_but_records(self, tmp_home, tmp_path, sample_servers, caplog):
+        source = self._setup_master(tmp_path, sample_servers)
+        with caplog.at_level("WARNING"):
             mcpshare.cmd_disable(mcpshare.Disable(servers=("nonexistent",)))
+        assert "not currently in master" in caplog.text
+        assert mcpshare.load_disabled(source) == {"*": ["nonexistent"]}
 
-    def test_enable_nonexistent_raises(self, tmp_home, tmp_path, sample_servers):
-        self._setup_master(tmp_path, sample_servers)
-        with pytest.raises(mcpshare.McpShareError, match="Server not found"):
-            mcpshare.cmd_enable(mcpshare.Enable(servers=("nonexistent",)))
+    def test_enable_nonexistent_is_silent_success(self, tmp_home, tmp_path, sample_servers):
+        source = self._setup_master(tmp_path, sample_servers)
+        # Should not raise even though never disabled.
+        mcpshare.cmd_enable(mcpshare.Enable(servers=("nonexistent",)))
+        assert mcpshare.load_disabled(source) == {}
 
     def test_disable_idempotent(self, tmp_home, tmp_path, sample_servers):
         source = self._setup_master(tmp_path, sample_servers)
         mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",)))
         mcpshare.cmd_disable(mcpshare.Disable(servers=("filesystem",)))
-        master = mcpshare.load_master(source)
-        assert master["mcpServers"]["filesystem"]["disabled"] is True
+        assert mcpshare.load_disabled(source) == {"*": ["filesystem"]}
 
     def test_enable_idempotent(self, tmp_home, tmp_path, sample_servers):
         source = self._setup_master(tmp_path, sample_servers)
-        # Enable a server that was never disabled
         mcpshare.cmd_enable(mcpshare.Enable(servers=("filesystem",)))
-        master = mcpshare.load_master(source)
-        assert "disabled" not in master["mcpServers"]["filesystem"]
+        assert mcpshare.load_disabled(source) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -527,37 +564,56 @@ class TestDisableEnable:
 # ---------------------------------------------------------------------------
 
 
-class TestDisabledFieldInWriters:
+class TestDisabledKeyRemoval:
+    """Per-entry 'disabled' state is owned exclusively by mcp.disabled.yaml.
+
+    Defense-in-depth: every reader drops any on-disk 'disabled' key so
+    legacy or hand-edited files can't smuggle it into the master.
+    """
+
     @pytest.fixture
-    def servers_with_disabled(self, sample_servers):
+    def on_disk_with_disabled(self, sample_servers):
         s = dict(sample_servers)
         s["filesystem"] = dict(s["filesystem"], disabled=True)
         return s
 
-    def test_write_copilot_preserves_disabled(self, tmp_path, servers_with_disabled):
-        path = tmp_path / "mcp-config.json"
-        mcpshare.write_copilot(path, servers_with_disabled)
-        data = json.loads(path.read_text())
-        assert data["mcpServers"]["filesystem"]["disabled"] is True
-
-    def test_write_claude_preserves_disabled(self, tmp_path, servers_with_disabled):
-        path = tmp_path / "mcp_servers.json"
-        mcpshare.write_claude(path, servers_with_disabled)
-        data = json.loads(path.read_text())
-        assert data["mcpServers"]["filesystem"]["disabled"] is True
-
-    def test_write_vscode_strips_disabled(self, tmp_path, servers_with_disabled):
+    def test_read_vscode_drops_disabled(self, tmp_path, on_disk_with_disabled):
         path = tmp_path / "mcp.json"
-        mcpshare.write_vscode(path, servers_with_disabled)
-        data = json.loads(path.read_text())
-        assert "disabled" not in data["servers"]["filesystem"]
+        path.write_text(json.dumps({"servers": {n: {"type": "stdio", **c} for n, c in on_disk_with_disabled.items()}}))
+        result = mcpshare.read_vscode(path)
+        assert "disabled" not in result["filesystem"]
 
-    def test_write_codex_strips_disabled(self, tmp_path, servers_with_disabled):
+    def test_read_claude_drops_disabled(self, tmp_path, on_disk_with_disabled):
+        path = tmp_path / "mcp_servers.json"
+        path.write_text(json.dumps({"mcpServers": on_disk_with_disabled}))
+        result = mcpshare.read_claude(path)
+        assert "disabled" not in result["filesystem"]
+
+    def test_read_copilot_drops_disabled(self, tmp_path, on_disk_with_disabled):
+        path = tmp_path / "mcp-config.json"
+        path.write_text(
+            json.dumps({"mcpServers": {n: {"type": "stdio", **c} for n, c in on_disk_with_disabled.items()}})
+        )
+        result = mcpshare.read_copilot(path)
+        assert "disabled" not in result["filesystem"]
+
+    def test_read_gemini_drops_disabled(self, tmp_path, on_disk_with_disabled):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"mcpServers": on_disk_with_disabled}))
+        result = mcpshare.read_gemini(path)
+        assert "disabled" not in result["filesystem"]
+
+    def test_read_codex_drops_enabled_field(self, tmp_path):
+        """read_codex strips 'enabled = false' without translating it.
+
+        Disable state lives in mcp.disabled.yaml; Codex's native flag must
+        not bleed into the canonical master.
+        """
         path = tmp_path / "config.toml"
-        mcpshare.write_codex(path, servers_with_disabled)
-        content = path.read_text()
-        assert "disabled" not in content
-        assert "enabled = false" in content
+        path.write_text('[mcp_servers.test-mcp]\ncommand = "echo"\nargs = []\nenabled = false\n')
+        result = mcpshare.read_codex(path)
+        assert "enabled" not in result["test-mcp"]
+        assert "disabled" not in result["test-mcp"]
 
     def test_write_codex_converts_tools_list_to_map(self, tmp_path):
         """Codex expects tools as a TOML map, not an array."""
@@ -568,32 +624,25 @@ class TestDisabledFieldInWriters:
         assert 'tools = { "*" = { enabled = true } }' in content
         assert 'tools = ["*"]' not in content
 
-    def test_read_codex_translates_enabled_false(self, tmp_path):
-        """read_codex converts Codex 'enabled = false' to canonical 'disabled = true'."""
+    def test_write_codex_emits_enabled_false_for_disabled_names(self, tmp_path, sample_servers):
+        """write_codex marks names in disabled_names with 'enabled = false'."""
         path = tmp_path / "config.toml"
-        path.write_text('[mcp_servers.test-mcp]\ncommand = "echo"\nargs = []\nenabled = false\n')
-        result = mcpshare.read_codex(path)
-        assert result["test-mcp"]["disabled"] is True
-        assert "enabled" not in result["test-mcp"]
+        mcpshare.write_codex(path, sample_servers, disabled_names={"filesystem"})
+        content = path.read_text()
+        assert "[mcp_servers.filesystem]" in content
+        assert "enabled = false" in content
+        # github is not disabled
+        github_block = content.split("[mcp_servers.github]")[1].split("[mcp_servers")[0]
+        assert "enabled = false" not in github_block
 
     def test_read_codex_tools_map_to_list(self, tmp_path):
         """read_codex converts Codex tools map back to canonical list."""
         path = tmp_path / "config.toml"
-        path.write_text('[mcp_servers.test-mcp]\ncommand = "echo"\nargs = []\n\n[mcp_servers.test-mcp.tools]\n"*" = {}\n')
+        path.write_text(
+            '[mcp_servers.test-mcp]\ncommand = "echo"\nargs = []\n\n[mcp_servers.test-mcp.tools]\n"*" = {}\n'
+        )
         result = mcpshare.read_codex(path)
         assert result["test-mcp"]["tools"] == ["*"]
-
-    def test_write_gemini_strips_disabled(self, tmp_path, servers_with_disabled):
-        path = tmp_path / "settings.json"
-        mcpshare.write_gemini(path, servers_with_disabled)
-        data = json.loads(path.read_text())
-        assert "disabled" not in data["mcpServers"]["filesystem"]
-
-    def test_write_opencode_strips_disabled(self, tmp_path, servers_with_disabled):
-        path = tmp_path / "opencode.json"
-        mcpshare.write_opencode(path, servers_with_disabled)
-        data = json.loads(path.read_text())
-        assert "disabled" not in data["mcp"]["filesystem"]
 
 
 # ---------------------------------------------------------------------------
@@ -601,18 +650,23 @@ class TestDisabledFieldInWriters:
 # ---------------------------------------------------------------------------
 
 
-class TestCollectPreservesDisabled:
-    def test_collect_preserves_disabled_flag(self, tmp_path, sample_servers):
-        source = str(tmp_path / "master")
-        disabled_servers = dict(sample_servers)
-        disabled_servers["filesystem"] = dict(disabled_servers["filesystem"], disabled=True)
-        mcpshare.save_master(source, {"mcpServers": disabled_servers})
+class TestCollectStripsDisabled:
+    def test_collect_strips_disabled_from_master(self, tmp_path, sample_servers):
+        """Master's per-entry 'disabled' flag is stripped on collect.
 
-        # Set up a vscode target that has the same server without disabled
+        mcp.disabled.yaml is the sole source of truth; the master must never
+        carry a 'disabled' key after a pull.
+        """
+        source = str(tmp_path / "master")
+        seeded = dict(sample_servers)
+        seeded["filesystem"] = dict(seeded["filesystem"], disabled=True)
+        # Write directly: save_master would strip it for us, so bypass.
+        Path(source).mkdir(parents=True, exist_ok=True)
+        (Path(source) / mcpshare.MASTER_FILENAME).write_text(json.dumps({"mcpServers": seeded}))
+
         vscode_dir = tmp_path / "vscode"
         vscode_dir.mkdir()
-        vscode_path = vscode_dir / "mcp.json"
-        mcpshare.write_vscode(vscode_path, {"filesystem": sample_servers["filesystem"]})
+        mcpshare.write_vscode(vscode_dir / "mcp.json", {"filesystem": sample_servers["filesystem"]})
 
         config = {
             "source": source,
@@ -620,7 +674,557 @@ class TestCollectPreservesDisabled:
             "targets": {"vscode": {"path": str(vscode_dir)}},
         }
         master = mcpshare.collect(config)
-        assert master["mcpServers"]["filesystem"]["disabled"] is True
+        assert "disabled" not in master["mcpServers"]["filesystem"]
+
+
+# ---------------------------------------------------------------------------
+# Conflict resolution during collect
+# ---------------------------------------------------------------------------
+
+
+class TestCollectConflicts:
+    def _config_with_two_vscode_like_targets(self, tmp_path):
+        """Two targets that both use the canonical vscode JSON layout.
+
+        We reuse `vscode` and `copilot` because they are the only two readers
+        currently registered in `READERS`.
+        """
+        source = str(tmp_path / "master")
+        targets = {}
+        for tool in ("vscode", "copilot"):
+            tdir = tmp_path / tool
+            tdir.mkdir()
+            targets[tool] = {"path": str(tdir)}
+        return {"source": source, "mode": "merge", "targets": targets}
+
+    def _seed(self, tmp_path, vscode_cfg, copilot_cfg):
+        config = self._config_with_two_vscode_like_targets(tmp_path)
+        vscode_path = mcpshare.resolve_target_path("vscode", config["targets"]["vscode"]["path"])
+        copilot_path = mcpshare.resolve_target_path("copilot", config["targets"]["copilot"]["path"])
+        mcpshare.write_vscode(vscode_path, {"shared-mcp": vscode_cfg})
+        mcpshare.write_copilot(copilot_path, {"shared-mcp": copilot_cfg})
+        return config
+
+    def test_no_prompt_when_configs_match(self, tmp_path, monkeypatch):
+        cfg = {"command": "npx", "args": ["-y", "foo"]}
+        config = self._seed(tmp_path, cfg, cfg)
+
+        def fail_prompt(*_a, **_kw):
+            raise AssertionError("should not prompt when configs are identical")
+
+        monkeypatch.setattr(mcpshare, "_prompt_conflict", fail_prompt)
+        monkeypatch.setattr(mcpshare.sys.stdin, "isatty", lambda: True)
+
+        master = mcpshare.collect(config, interactive=True)
+        assert master["mcpServers"]["shared-mcp"] == cfg
+
+    def test_prompt_keep_current(self, tmp_path, monkeypatch):
+        vscode_cfg = {"command": "npx", "args": ["-y", "vscode-version"]}
+        copilot_cfg = {"command": "npx", "args": ["-y", "copilot-version"]}
+        config = self._seed(tmp_path, vscode_cfg, copilot_cfg)
+
+        calls = []
+
+        def fake_prompt(name, cur_src, cur_cfg, new_src, new_cfg):
+            calls.append((name, cur_src, new_src))
+            return False  # keep current (vscode)
+
+        monkeypatch.setattr(mcpshare, "_prompt_conflict", fake_prompt)
+        monkeypatch.setattr(mcpshare.sys.stdin, "isatty", lambda: True)
+
+        master = mcpshare.collect(config, interactive=True)
+        assert calls == [("shared-mcp", "vscode", "copilot")]
+        assert master["mcpServers"]["shared-mcp"] == vscode_cfg
+
+    def test_prompt_use_new(self, tmp_path, monkeypatch):
+        vscode_cfg = {"command": "npx", "args": ["-y", "vscode-version"]}
+        copilot_cfg = {"command": "npx", "args": ["-y", "copilot-version"]}
+        config = self._seed(tmp_path, vscode_cfg, copilot_cfg)
+
+        monkeypatch.setattr(mcpshare, "_prompt_conflict", lambda *a, **kw: True)
+        monkeypatch.setattr(mcpshare.sys.stdin, "isatty", lambda: True)
+
+        master = mcpshare.collect(config, interactive=True)
+        assert master["mcpServers"]["shared-mcp"] == copilot_cfg
+
+    def test_non_interactive_silently_takes_later(self, tmp_path, monkeypatch):
+        vscode_cfg = {"command": "npx", "args": ["-y", "vscode-version"]}
+        copilot_cfg = {"command": "npx", "args": ["-y", "copilot-version"]}
+        config = self._seed(tmp_path, vscode_cfg, copilot_cfg)
+
+        def fail_prompt(*_a, **_kw):
+            raise AssertionError("should not prompt in non-interactive mode")
+
+        monkeypatch.setattr(mcpshare, "_prompt_conflict", fail_prompt)
+        monkeypatch.setattr(mcpshare.sys.stdin, "isatty", lambda: True)
+
+        master = mcpshare.collect(config, interactive=False)
+        # Later target (copilot) wins, matching legacy last-write semantics.
+        assert master["mcpServers"]["shared-mcp"] == copilot_cfg
+
+    def test_no_tty_skips_prompt(self, tmp_path, monkeypatch):
+        vscode_cfg = {"command": "npx", "args": ["-y", "vscode-version"]}
+        copilot_cfg = {"command": "npx", "args": ["-y", "copilot-version"]}
+        config = self._seed(tmp_path, vscode_cfg, copilot_cfg)
+
+        def fail_prompt(*_a, **_kw):
+            raise AssertionError("should not prompt without a TTY")
+
+        monkeypatch.setattr(mcpshare, "_prompt_conflict", fail_prompt)
+        monkeypatch.setattr(mcpshare.sys.stdin, "isatty", lambda: False)
+
+        master = mcpshare.collect(config, interactive=True)
+        assert master["mcpServers"]["shared-mcp"] == copilot_cfg
+
+    def test_disabled_flag_only_is_not_a_conflict(self, tmp_path, monkeypatch):
+        cfg = {"command": "npx", "args": ["-y", "foo"]}
+        source = str(tmp_path / "master")
+        # Master has the server marked disabled (legacy on-disk state).
+        Path(source).mkdir(parents=True, exist_ok=True)
+        (Path(source) / mcpshare.MASTER_FILENAME).write_text(
+            json.dumps({"mcpServers": {"foo-mcp": dict(cfg, disabled=True)}})
+        )
+        vscode_dir = tmp_path / "vscode"
+        vscode_dir.mkdir()
+        mcpshare.write_vscode(vscode_dir / "mcp.json", {"foo-mcp": cfg})
+        config = {
+            "source": source,
+            "mode": "merge",
+            "targets": {"vscode": {"path": str(vscode_dir)}},
+        }
+
+        def fail_prompt(*_a, **_kw):
+            raise AssertionError("disabled-only diff should not be treated as a conflict")
+
+        monkeypatch.setattr(mcpshare, "_prompt_conflict", fail_prompt)
+        monkeypatch.setattr(mcpshare.sys.stdin, "isatty", lambda: True)
+
+        master = mcpshare.collect(config, interactive=True)
+        # The flag is stripped during collect; mcp.disabled.yaml owns disable state.
+        assert "disabled" not in master["mcpServers"]["foo-mcp"]
+
+
+# ---------------------------------------------------------------------------
+# Distribute: file deletion and per-IDE disabled list filtering
+# ---------------------------------------------------------------------------
+
+
+class TestDistributeBehavior:
+    def _make_config(self, tmp_path, tools=("vscode", "copilot")):
+        targets = {}
+        for tool in tools:
+            tdir = tmp_path / tool
+            tdir.mkdir(exist_ok=True)
+            targets[tool] = {"path": str(tdir)}
+        source = tmp_path / "master"
+        source.mkdir(exist_ok=True)
+        return {"source": str(source), "mode": "merge", "targets": targets}
+
+    def test_dedicated_file_is_recreated_not_merged(self, tmp_home, tmp_path, sample_servers):
+        """An old VSCode mcp.json with stale top-level keys is removed before write."""
+        config = self._make_config(tmp_path, tools=("vscode",))
+        vscode_path = mcpshare.resolve_target_path("vscode", config["targets"]["vscode"]["path"])
+        # Seed with an unrelated stale top-level key.
+        vscode_path.write_text(json.dumps({"servers": {"stale-mcp": {"command": "old"}}, "stale_top_key": 1}))
+        master = {"mcpServers": {"filesystem": sample_servers["filesystem"]}}
+
+        mcpshare.distribute(config, master)
+
+        data = json.loads(vscode_path.read_text())
+        assert "stale_top_key" not in data, "dedicated MCP file must be wiped before write"
+        assert set(data["servers"]) == {"filesystem"}
+
+    # ---- Gemini native disable: mcp.excluded in settings.json ----
+
+    def test_gemini_writes_disabled_to_mcp_excluded(self, tmp_home, tmp_path, sample_servers):
+        """Gemini's native disable: keep the server in mcpServers, list it in mcp.excluded."""
+        config = self._make_config(tmp_path, tools=("gemini",))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        gemini_data = json.loads(
+            mcpshare.resolve_target_path("gemini", config["targets"]["gemini"]["path"]).read_text()
+        )
+        # Server is written normally — it stays visible to Gemini's UI.
+        assert "filesystem" in gemini_data["mcpServers"]
+        # Disable is applied via the native blocklist.
+        assert gemini_data["mcp"]["excluded"] == ["filesystem"]
+
+    def test_gemini_preserves_other_mcp_keys(self, tmp_home, tmp_path, sample_servers):
+        """Updating mcp.excluded must not clobber other mcp.* keys (e.g. allowed)."""
+        config = self._make_config(tmp_path, tools=("gemini",))
+        mcpshare.save_config(config)
+        gemini_path = mcpshare.resolve_target_path("gemini", config["targets"]["gemini"]["path"])
+        gemini_path.parent.mkdir(parents=True, exist_ok=True)
+        gemini_path.write_text(json.dumps({"theme": "dark", "mcp": {"allowed": ["my-trusted"]}}))
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        data = json.loads(gemini_path.read_text())
+        assert data["theme"] == "dark"
+        assert data["mcp"]["allowed"] == ["my-trusted"]
+        assert data["mcp"]["excluded"] == ["filesystem"]
+
+    def test_gemini_drops_mcp_section_when_nothing_disabled(self, tmp_home, tmp_path, sample_servers):
+        """No disabled servers and no other mcp.* keys → the mcp section is removed."""
+        config = self._make_config(tmp_path, tools=("gemini",))
+        mcpshare.save_config(config)
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        data = json.loads(mcpshare.resolve_target_path("gemini", config["targets"]["gemini"]["path"]).read_text())
+        assert "filesystem" in data["mcpServers"]
+        assert "mcp" not in data
+
+    def test_gemini_per_ide_disable_isolated(self, tmp_home, tmp_path, sample_servers):
+        """A gemini-only disable doesn't affect opencode's payload."""
+        config = self._make_config(tmp_path, tools=("gemini", "opencode"))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"gemini": ["filesystem"]})
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        gemini_data = json.loads(
+            mcpshare.resolve_target_path("gemini", config["targets"]["gemini"]["path"]).read_text()
+        )
+        opencode_data = json.loads(
+            mcpshare.resolve_target_path("opencode", config["targets"]["opencode"]["path"]).read_text()
+        )
+        assert gemini_data["mcp"]["excluded"] == ["filesystem"]
+        assert opencode_data["mcp"]["filesystem"].get("enabled") is not False
+
+    # ---- OpenCode native disable: per-entry "enabled": false ----
+
+    def test_opencode_writes_disabled_with_enabled_false(self, tmp_home, tmp_path, sample_servers):
+        """OpenCode's native disable: per-entry "enabled": false."""
+        config = self._make_config(tmp_path, tools=("opencode",))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        opencode_data = json.loads(
+            mcpshare.resolve_target_path("opencode", config["targets"]["opencode"]["path"]).read_text()
+        )
+        # Both servers are written.
+        assert "filesystem" in opencode_data["mcp"]
+        assert "github" in opencode_data["mcp"]
+        # Only the disabled one carries enabled = false.
+        assert opencode_data["mcp"]["filesystem"]["enabled"] is False
+        assert "enabled" not in opencode_data["mcp"]["github"]
+
+    # ---- "none" strategy (vscode: write everything as enabled) ----
+
+    def test_vscode_writes_disabled_server_as_enabled(self, tmp_home, tmp_path, sample_servers):
+        """VSCode has no JSON disable; disabled servers are written as-enabled."""
+        config = self._make_config(tmp_path, tools=("vscode",))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        vscode_data = json.loads(
+            mcpshare.resolve_target_path("vscode", config["targets"]["vscode"]["path"]).read_text()
+        )
+        assert "filesystem" in vscode_data["servers"], "VSCode receives every server"
+        assert "disabled" not in vscode_data["servers"]["filesystem"]
+
+    def test_vscode_ignores_per_ide_disable(self, tmp_home, tmp_path, sample_servers):
+        """A vscode-specific disable entry is ignored on sync (VSCode = 'none')."""
+        config = self._make_config(tmp_path, tools=("vscode",))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"vscode": ["filesystem"]})
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        vscode_data = json.loads(
+            mcpshare.resolve_target_path("vscode", config["targets"]["vscode"]["path"]).read_text()
+        )
+        assert "filesystem" in vscode_data["servers"]
+
+    # ---- in_file_flag strategy (codex) ----
+
+    def test_codex_writes_disabled_with_enabled_false(self, tmp_home, tmp_path, sample_servers):
+        config = self._make_config(tmp_path, tools=("codex",))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        codex_path = mcpshare.resolve_target_path("codex", config["targets"]["codex"]["path"])
+        content = codex_path.read_text()
+        assert "[mcp_servers.filesystem]" in content
+        assert "[mcp_servers.github]" in content
+        # Only the filesystem block carries 'enabled = false' (Codex's native disable).
+        fs_block = content.split("[mcp_servers.filesystem]")[1].split("[mcp_servers")[0]
+        gh_block = content.split("[mcp_servers.github]")[1].split("[mcp_servers")[0]
+        assert "enabled = false" in fs_block
+        assert "enabled = false" not in gh_block
+
+    # ---- settings_json strategy (claude, copilot) ----
+
+    def test_claude_writes_disabled_to_settings_json(self, tmp_home, tmp_path, sample_servers):
+        """Disabled servers appear in mcp_servers.json AND in settings.json."""
+        config = self._make_config(tmp_path, tools=("claude",))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        claude_dir = Path(config["targets"]["claude"]["path"])
+        servers_data = json.loads((claude_dir / "mcp_servers.json").read_text())
+        settings_data = json.loads((claude_dir / "settings.json").read_text())
+
+        # Server is written as normal.
+        assert "filesystem" in servers_data["mcpServers"]
+        assert "disabled" not in servers_data["mcpServers"]["filesystem"]
+        # Native disable list reflects mcpshare's view.
+        assert settings_data["disabledMcpServers"] == ["filesystem"]
+
+    def test_copilot_writes_disabled_to_settings_json(self, tmp_home, tmp_path, sample_servers):
+        config = self._make_config(tmp_path, tools=("copilot",))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        copilot_dir = Path(config["targets"]["copilot"]["path"])
+        servers_data = json.loads((copilot_dir / "mcp-config.json").read_text())
+        settings_data = json.loads((copilot_dir / "settings.json").read_text())
+
+        assert "filesystem" in servers_data["mcpServers"]
+        assert "disabled" not in servers_data["mcpServers"]["filesystem"]
+        assert settings_data["disabledMcpServers"] == ["filesystem"]
+
+    def test_settings_json_preserves_unrelated_keys(self, tmp_home, tmp_path, sample_servers):
+        """Updating disabledMcpServers must not clobber other settings.json keys."""
+        config = self._make_config(tmp_path, tools=("claude",))
+        mcpshare.save_config(config)
+        claude_dir = Path(config["targets"]["claude"]["path"])
+        # Seed settings.json with unrelated keys the user owns.
+        (claude_dir / "settings.json").write_text(json.dumps({"theme": "dark", "permissions": {"allow": ["Read(*)"]}}))
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        settings_data = json.loads((claude_dir / "settings.json").read_text())
+        assert settings_data["theme"] == "dark"
+        assert settings_data["permissions"] == {"allow": ["Read(*)"]}
+        assert settings_data["disabledMcpServers"] == ["filesystem"]
+
+    def test_settings_json_overwrites_native_disabled_list(self, tmp_home, tmp_path, sample_servers):
+        """mcpshare-owns: the disabledMcpServers array is replaced, not merged."""
+        config = self._make_config(tmp_path, tools=("claude",))
+        mcpshare.save_config(config)
+        claude_dir = Path(config["targets"]["claude"]["path"])
+        # User had a different server disabled natively.
+        (claude_dir / "settings.json").write_text(json.dumps({"disabledMcpServers": ["github", "some-orphan"]}))
+        # mcpshare disables only filesystem; github stays enabled.
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        settings_data = json.loads((claude_dir / "settings.json").read_text())
+        assert settings_data["disabledMcpServers"] == ["filesystem"]
+
+    def test_settings_json_re_enable_warning(self, tmp_home, tmp_path, sample_servers, caplog):
+        """When mcpshare re-enables a natively-disabled server, log a warning."""
+        config = self._make_config(tmp_path, tools=("claude",))
+        mcpshare.save_config(config)
+        claude_dir = Path(config["targets"]["claude"]["path"])
+        # User had 'github' disabled natively in Claude.
+        (claude_dir / "settings.json").write_text(json.dumps({"disabledMcpServers": ["github"]}))
+        # mcpshare doesn't know about that disable.
+        with caplog.at_level("WARNING"):
+            mcpshare.distribute(config, {"mcpServers": sample_servers})
+        assert "re-enabling github" in caplog.text
+
+    def test_settings_json_removed_when_no_disabled(self, tmp_home, tmp_path, sample_servers):
+        """If no servers are disabled, the disabledMcpServers key is removed."""
+        config = self._make_config(tmp_path, tools=("claude",))
+        mcpshare.save_config(config)
+        claude_dir = Path(config["targets"]["claude"]["path"])
+        (claude_dir / "settings.json").write_text(json.dumps({"theme": "dark"}))
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        settings_data = json.loads((claude_dir / "settings.json").read_text())
+        assert "disabledMcpServers" not in settings_data
+        assert settings_data["theme"] == "dark"
+
+    # ---- master.disabled is ignored: only mcp.disabled.yaml matters ----
+
+    def test_master_disabled_flag_is_ignored_by_gemini(self, tmp_home, tmp_path, sample_servers):
+        """A stray 'disabled: true' on master has no effect on Gemini's output."""
+        config = self._make_config(tmp_path, tools=("gemini",))
+        mcpshare.save_config(config)
+        seeded = dict(sample_servers)
+        seeded["filesystem"] = dict(seeded["filesystem"], disabled=True)
+
+        mcpshare.distribute(config, {"mcpServers": seeded})
+
+        gemini_data = json.loads(
+            mcpshare.resolve_target_path("gemini", config["targets"]["gemini"]["path"]).read_text()
+        )
+        # mcp.disabled.yaml is empty, so filesystem must be written enabled.
+        assert "filesystem" in gemini_data["mcpServers"]
+        assert "mcp" not in gemini_data, "no disabled entries → no mcp.excluded"
+
+    def test_master_disabled_flag_is_ignored_settings_json_strategy(self, tmp_home, tmp_path, sample_servers):
+        """A stray 'disabled: true' on master never reaches settings.json."""
+        config = self._make_config(tmp_path, tools=("claude",))
+        mcpshare.save_config(config)
+        seeded = dict(sample_servers)
+        seeded["filesystem"] = dict(seeded["filesystem"], disabled=True)
+
+        mcpshare.distribute(config, {"mcpServers": seeded})
+
+        claude_dir = Path(config["targets"]["claude"]["path"])
+        settings_path = claude_dir / "settings.json"
+        assert not settings_path.exists() or "disabledMcpServers" not in json.loads(settings_path.read_text())
+
+    def test_disabled_persists_across_sync_after_master_regen(self, tmp_home, tmp_path, sample_servers):
+        """Core scenario: master is wiped and regenerated; mcp.disabled.yaml still hides it."""
+        config = self._make_config(tmp_path, tools=("gemini",))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+
+        master_path = Path(config["source"]) / mcpshare.MASTER_FILENAME
+        master_path.write_text(json.dumps({"mcpServers": sample_servers}))
+
+        master = mcpshare.load_master(config["source"])
+        mcpshare.distribute(config, master)
+
+        gemini_data = json.loads(
+            mcpshare.resolve_target_path("gemini", config["targets"]["gemini"]["path"]).read_text()
+        )
+        # Server is written, but recorded in mcp.excluded (Gemini's native disable).
+        assert "filesystem" in gemini_data["mcpServers"]
+        assert gemini_data["mcp"]["excluded"] == ["filesystem"]
+
+
+# ---------------------------------------------------------------------------
+# Distribute helpers (unit-level)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteNativeDisabledList:
+    """Unit tests for the read-modify-write of settings.json."""
+
+    def test_creates_new_file_with_disabled_list(self, tmp_path):
+        path = tmp_path / "settings.json"
+        previous = mcpshare._write_native_disabled_list(path, {"foo-mcp"})
+        assert previous == set()
+        assert json.loads(path.read_text()) == {"disabledMcpServers": ["foo-mcp"]}
+
+    def test_preserves_unrelated_keys(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"theme": "dark", "permissions": ["Read"]}))
+
+        mcpshare._write_native_disabled_list(path, {"foo-mcp", "bar-mcp"})
+
+        data = json.loads(path.read_text())
+        assert data["theme"] == "dark"
+        assert data["permissions"] == ["Read"]
+        assert data["disabledMcpServers"] == ["bar-mcp", "foo-mcp"]
+
+    def test_empty_set_removes_key(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"theme": "dark", "disabledMcpServers": ["old-mcp"]}))
+
+        mcpshare._write_native_disabled_list(path, set())
+
+        data = json.loads(path.read_text())
+        assert "disabledMcpServers" not in data
+        assert data["theme"] == "dark"
+
+    def test_returns_previous_names(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"disabledMcpServers": ["a-mcp", "b-mcp"]}))
+
+        previous = mcpshare._write_native_disabled_list(path, {"c-mcp"})
+
+        assert previous == {"a-mcp", "b-mcp"}
+
+    def test_handles_non_list_previous_value(self, tmp_path):
+        """Pre-existing settings.json with a wrong-type value shouldn't crash."""
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"disabledMcpServers": "garbage"}))
+
+        previous = mcpshare._write_native_disabled_list(path, {"a-mcp"})
+
+        assert previous == set()
+        assert json.loads(path.read_text())["disabledMcpServers"] == ["a-mcp"]
+
+
+# ---------------------------------------------------------------------------
+# Disabled persistence helpers
+# ---------------------------------------------------------------------------
+
+
+class TestDisabledHelpers:
+    def test_load_disabled_missing_returns_empty(self, tmp_home, tmp_path):
+        source = str(tmp_path / "master")
+        assert mcpshare.load_disabled(source) == {}
+
+    def test_save_and_load_roundtrip(self, tmp_home, tmp_path):
+        source = str(tmp_path / "master")
+        mcpshare.save_disabled(source, {"*": ["a", "b"], "vscode": ["c"]})
+        assert mcpshare.load_disabled(source) == {"*": ["a", "b"], "vscode": ["c"]}
+
+    def test_save_empty_removes_file(self, tmp_home, tmp_path):
+        source = str(tmp_path / "master")
+        mcpshare.save_disabled(source, {"*": ["a"]})
+        assert mcpshare.disabled_file_path(source).exists()
+        mcpshare.save_disabled(source, {"*": []})
+        assert not mcpshare.disabled_file_path(source).exists()
+
+    def test_disabled_file_lives_next_to_master(self, tmp_home, tmp_path):
+        source = str(tmp_path / "some" / "nested" / "master")
+        mcpshare.save_disabled(source, {"*": ["a"]})
+        # File should be created at <source>/mcp.disabled.yaml, not in CONFIG_DIR.
+        assert (Path(source) / mcpshare.DISABLED_FILENAME).exists()
+
+    def test_disabled_for_tool_unions_global_and_specific(self):
+        data = {"*": ["a"], "vscode": ["b"], "claude": ["c"]}
+        assert mcpshare.disabled_for_tool(data, "vscode") == {"a", "b"}
+        assert mcpshare.disabled_for_tool(data, "claude") == {"a", "c"}
+        assert mcpshare.disabled_for_tool(data, "gemini") == {"a"}
+
+    def test_load_disabled_invalid_yaml_raises(self, tmp_home, tmp_path):
+        source = tmp_path / "master"
+        source.mkdir()
+        (source / mcpshare.DISABLED_FILENAME).write_text("not: [valid")
+        with pytest.raises(mcpshare.ConfigParseError):
+            mcpshare.load_disabled(str(source))
+
+    def test_legacy_disabled_migrates_on_first_load(self, tmp_home, tmp_path):
+        """An old ~/.config/mcpshare/disabled.yaml is moved next to the master."""
+        source = tmp_path / "master"
+        source.mkdir()
+        legacy_path = mcpshare._legacy_disabled_path()
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text("'*':\n  - legacy-server\n")
+
+        data = mcpshare.load_disabled(str(source))
+
+        assert data == {"*": ["legacy-server"]}
+        assert not legacy_path.exists(), "legacy file should be removed after migration"
+        assert (source / mcpshare.DISABLED_FILENAME).exists()
+
+    def test_legacy_disabled_not_migrated_if_new_exists(self, tmp_home, tmp_path):
+        """If the new location already exists, the legacy file is left alone."""
+        source = tmp_path / "master"
+        source.mkdir()
+        (source / mcpshare.DISABLED_FILENAME).write_text("'*':\n  - new-server\n")
+        legacy_path = mcpshare._legacy_disabled_path()
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text("'*':\n  - legacy-server\n")
+
+        data = mcpshare.load_disabled(str(source))
+
+        assert data == {"*": ["new-server"]}
+        assert legacy_path.exists(), "legacy file is preserved when new file already exists"
 
 
 # ---------------------------------------------------------------------------
