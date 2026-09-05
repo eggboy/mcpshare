@@ -188,6 +188,22 @@ class TestReaders:
         assert '[mcp_servers."microsoft.docs.mcp"]' in content
         assert "[mcp_servers.simple]" in content
 
+    def test_write_codex_uses_http_headers(self, tmp_path):
+        """Codex calls HTTP transport headers ``http_headers``."""
+        path = tmp_path / "config.toml"
+        servers = {
+            "remote": {
+                "url": "https://example.com/mcp",
+                "headers": {"Authorization": "Basic redacted"},
+            }
+        }
+
+        mcpshare.write_codex(path, servers)
+
+        parsed = mcpshare._parse_toml_mcp_servers(path.read_text())
+        assert parsed["remote"]["http_headers"] == {"Authorization": "Basic redacted"}
+        assert "headers" not in parsed["remote"]
+
     def test_read_gemini(self, tmp_path):
         path = tmp_path / "settings.json"
         data = {

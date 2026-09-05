@@ -657,6 +657,9 @@ def write_codex(
     Names listed in *disabled_names* receive ``enabled = false`` in their
     section (Codex's native disable mechanism).
 
+    Canonical ``headers`` entries are emitted as ``http_headers``, which is
+    the key Codex expects for HTTP transport headers.
+
     Returns a tuple of (server count, list of skipped server descriptions).
     """
     disabled = set(disabled_names)
@@ -686,7 +689,8 @@ def write_codex(
             # Codex expects 'tools' as a map of {name: McpServerToolConfig}
             if key == "tools" and isinstance(val, list):
                 val = {item: {"enabled": True} for item in val}
-            parts.append(f"{key} = {_format_toml_value(val)}")
+            codex_key = "http_headers" if key == "headers" else key
+            parts.append(f"{codex_key} = {_format_toml_value(val)}")
     parts.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)

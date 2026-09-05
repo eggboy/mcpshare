@@ -15,18 +15,6 @@ definitions across **VSCode**, **GitHub Copilot CLI**, **Claude Code**,
 
 ## Quick start
 
-### With `uv`
-
-```bash
-# Run directly with PEP 723 inline metadata
-uv run mcpshare.py init   # create default config
-uv run mcpshare.py pull   # pull servers from targets into master
-uv run mcpshare.py sync   # distribute master to all targets
-uv run mcpshare.py status # show current state
-```
-
-### With `uv tool install`
-
 ```bash
 # Install as a global CLI tool from GitHub
 uv tool install git+https://github.com/eggboy/mcpshare.git
