@@ -9,7 +9,7 @@
 """mcpshare - Synchronize MCP configurations between coding agents.
 
 Supports VSCode, Claude Code, GitHub Copilot CLI, OpenAI Codex,
-Google Gemini CLI, and OpenCode.
+Google Gemini CLI, Google Antigravity, and OpenCode.
 """
 
 import importlib.metadata
@@ -60,21 +60,26 @@ DISABLED_ALL = "*"
 # delete-and-recreate during sync so stale entries can never linger.
 # Tools NOT in this set share the file with unrelated IDE settings, so
 # we only overwrite the MCP section within the file.
-MCP_DEDICATED_TOOLS = frozenset({"claude", "vscode", "copilot"})
+MCP_DEDICATED_TOOLS = frozenset({"vscode", "copilot"})
 
 # Filename of the native settings file (relative to the target directory)
-# used by Claude Code and Copilot CLI for their ``disabledMcpServers`` array.
+# used by Copilot CLI for its ``disabledMcpServers`` array.
 NATIVE_SETTINGS_FILENAME = "settings.json"
 NATIVE_DISABLED_KEY = "disabledMcpServers"
+
+# Files mcpshare wrote for Claude Code before it targeted ``.claude.json``.
+# Claude never read them; :func:`_cleanup_legacy_claude` removes them.
+CLAUDE_LEGACY_FILENAME = "mcp_servers.json"
 
 # Human-readable description of each tool's native disable mechanism,
 # shown by ``mcpshare status``. The actual mechanism lives inside each
 # writer; this dict is purely cosmetic.
 DISABLE_DESCRIPTION = {
-    "claude": "settings.json/disabledMcpServers",
+    "claude": "omitted from .claude.json",
     "copilot": "settings.json/disabledMcpServers",
     "codex": "enabled = false in TOML",
     "gemini": "settings.json/mcp.excluded",
+    "antigravity": '"disabled": true in mcp_config.json',
     "opencode": '"enabled": false in opencode.json',
     "vscode": "UI only (write everything)",
 }
@@ -120,23 +125,29 @@ def _vscode_config_dir() -> Path:
     return Path.home() / ".config" / "Code" / "User"
 
 
+# Claude Code's default config dir.  Its user-scope MCP servers live in
+# ``~/.claude.json``, outside this dir (see :func:`resolve_target_path`).
+CLAUDE_CONFIG_DIR = Path.home() / ".claude"
+
 # Default config locations for each tool (user-level)
 DEFAULT_CONFIG_PATHS = {
-    "claude": Path.home() / ".claude" / "mcp_servers.json",
+    "claude": Path.home() / ".claude.json",
     "vscode": _vscode_config_dir() / "mcp.json",
     "copilot": Path.home() / ".copilot" / "mcp-config.json",
     "codex": Path.home() / ".codex" / "config.toml",
     "gemini": Path.home() / ".gemini" / "settings.json",
+    "antigravity": Path.home() / ".gemini" / "config" / "mcp_config.json",
     "opencode": Path.home() / ".config" / "opencode" / "opencode.json",
 }
 
 # Output filenames when writing to target directories
 TARGET_FILENAMES = {
-    "claude": "mcp_servers.json",
+    "claude": ".claude.json",
     "vscode": "mcp.json",
     "copilot": "mcp-config.json",
     "codex": "config.toml",
     "gemini": "settings.json",
+    "antigravity": "mcp_config.json",
     "opencode": "opencode.json",
 }
 
@@ -148,11 +159,12 @@ def default_config() -> dict[str, Any]:
         "source": source,
         "mode": "merge",
         "targets": {
-            "claude": {"path": str(DEFAULT_CONFIG_PATHS["claude"].parent)},
+            "claude": {"path": str(CLAUDE_CONFIG_DIR)},
             "vscode": {"path": str(DEFAULT_CONFIG_PATHS["vscode"].parent)},
             "copilot": {"path": str(DEFAULT_CONFIG_PATHS["copilot"].parent)},
             "codex": {"path": str(DEFAULT_CONFIG_PATHS["codex"].parent)},
             "gemini": {"path": str(DEFAULT_CONFIG_PATHS["gemini"].parent)},
+            "antigravity": {"path": str(DEFAULT_CONFIG_PATHS["antigravity"].parent)},
             "opencode": {
                 "path": str(DEFAULT_CONFIG_PATHS["opencode"].parent),
             },
@@ -340,9 +352,9 @@ def read_vscode(path: Path) -> dict[str, Any]:
 
 
 def read_claude(path: Path) -> dict[str, Any]:
-    """Read MCP servers from Claude Code settings.json or .mcp.json.
+    """Read user-scope MCP servers from Claude Code ``~/.claude.json``.
 
-    Claude uses ``{"mcpServers": {"name": {"command": ...}}}``.
+    Claude uses ``{"mcpServers": {"name": {"type": "stdio", "command": ...}}}``.
 
     Raises:
         ConfigParseError: If the file contains invalid JSON.
@@ -451,6 +463,29 @@ def read_gemini(path: Path) -> dict[str, Any]:
     return {name: {k: v for k, v in cfg.items() if k not in _READER_DROPPED_KEYS} for name, cfg in servers.items()}
 
 
+def read_antigravity(path: Path) -> dict[str, Any]:
+    """Read MCP servers from Antigravity mcp_config.json.
+
+    Antigravity uses ``{"mcpServers": {"name": {"command": ...}}}`` with
+    ``serverUrl`` for remote servers, which becomes the canonical ``url``.
+
+    Raises:
+        ConfigParseError: If the file contains invalid JSON.
+    """
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ConfigParseError(f"Invalid JSON in {path}: {exc}") from exc
+    servers = data.get("mcpServers", {})
+    return {
+        name: {("url" if k == "serverUrl" else k): v for k, v in cfg.items() if k not in _READER_DROPPED_KEYS}
+        for name, cfg in servers.items()
+    }
+
+
 def read_opencode(path: Path) -> dict[str, Any]:
     """Read MCP servers from OpenCode opencode.json.
 
@@ -488,6 +523,7 @@ READERS = {
     "copilot": read_copilot,
     # "codex": read_codex,
     # "gemini": read_gemini,
+    # "antigravity": read_antigravity,
     # "opencode": read_opencode,
 }
 
@@ -537,35 +573,40 @@ def write_vscode(path: Path, servers: dict[str, Any], **_: Any) -> tuple[int, li
     return len(vscode_servers), []
 
 
+# Canonical keys outside Claude Code's server schema: ``tools`` is a Codex
+# allow-list, and disable state lives only in ``mcp.disabled.yaml``.
+_CLAUDE_DROPPED_KEYS = frozenset({"tools", "disabled"})
+
+
 def write_claude(
     path: Path, servers: dict[str, Any], *, disabled_names: Iterable[str] = (), **_: Any
 ) -> tuple[int, list[str]]:
-    """Write MCP servers in Claude Code format.
+    """Write MCP servers into Claude Code ``~/.claude.json``.
 
-    Produces ``{"mcpServers": {"name": {"command": ...}}}``.  Claude Code
-    silently ignores per-server disable flags in ``mcp_servers.json`` and
-    instead reads a top-level ``disabledMcpServers`` array from
-    ``settings.json`` (managed via :func:`_emit_native_disabled`, called
-    here as the IDE-native disable mechanism).
+    Replaces only the top-level ``mcpServers`` object (Claude's user scope);
+    every other key in the file is Claude's own state and is preserved.
+    Each entry gets ``"type": "stdio"|"http"``, since Claude rejects a
+    remote server that has a ``url`` but no ``type``.  Claude has no global
+    disable list (its ``disabledMcpServers`` is per project), so names in
+    *disabled_names* are left out of ``mcpServers`` entirely.
 
     Returns a tuple of (server count, list of skipped server descriptions).
     """
+    disabled = set(disabled_names)
     existing = {}
     if path.exists():
         with open(path) as f:
             existing = json.load(f)
-    existing["mcpServers"] = dict(servers)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(existing, f, indent=2)
-        f.write("\n")
-    _emit_native_disabled(
-        "claude",
-        path.parent / NATIVE_SETTINGS_FILENAME,
-        set(disabled_names),
-        set(servers),
-    )
-    return len(servers), []
+    claude_servers = {}
+    for name, cfg in servers.items():
+        if name in disabled:
+            continue
+        entry = {"type": _server_type(cfg)}
+        entry.update({k: v for k, v in cfg.items() if k not in _CLAUDE_DROPPED_KEYS})
+        claude_servers[name] = entry
+    existing["mcpServers"] = claude_servers
+    _atomic_write_json(path, existing)
+    return len(claude_servers), []
 
 
 def write_copilot(
@@ -738,6 +779,42 @@ def write_gemini(
     return len(servers), []
 
 
+# Canonical keys outside Antigravity's server schema: it has no ``type``,
+# ``tools`` is a Codex allow-list (Antigravity only has a deny-list), and
+# disable state lives only in ``mcp.disabled.yaml``.
+_ANTIGRAVITY_DROPPED_KEYS = frozenset({"type", "tools", "disabled"})
+
+
+def write_antigravity(
+    path: Path, servers: dict[str, Any], *, disabled_names: Iterable[str] = (), **_: Any
+) -> tuple[int, list[str]]:
+    """Write MCP servers in Antigravity mcp_config.json format.
+
+    Produces ``{"mcpServers": {"name": {"command": ...}}}``, the file shared
+    by the Antigravity app, IDE and CLI.  Canonical ``url`` entries are
+    emitted as ``serverUrl``, the only remote-server key Antigravity
+    accepts.  Names in *disabled_names* receive ``"disabled": true``
+    (Antigravity's native per-entry disable flag).  Other top-level keys
+    are preserved.
+
+    Returns a tuple of (server count, list of skipped server descriptions).
+    """
+    disabled = set(disabled_names)
+    existing = {}
+    if path.exists():
+        with open(path) as f:
+            existing = json.load(f)
+    ag_servers = {}
+    for name, cfg in servers.items():
+        entry = {("serverUrl" if k == "url" else k): v for k, v in cfg.items() if k not in _ANTIGRAVITY_DROPPED_KEYS}
+        if name in disabled:
+            entry["disabled"] = True
+        ag_servers[name] = entry
+    existing["mcpServers"] = ag_servers
+    _atomic_write_json(path, existing)
+    return len(ag_servers), []
+
+
 def write_opencode(
     path: Path, servers: dict[str, Any], *, disabled_names: Iterable[str] = (), **_: Any
 ) -> tuple[int, list[str]]:
@@ -789,8 +866,28 @@ WRITERS = {
     "copilot": write_copilot,
     "codex": write_codex,
     "gemini": write_gemini,
+    "antigravity": write_antigravity,
     "opencode": write_opencode,
 }
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write *data* as JSON to *path* atomically.
+
+    Data goes to a sibling temp file that is then renamed into place, so a
+    reader never sees a half-written file.  A symlinked *path* is written
+    through to its target, and an existing file's permission bits carry
+    over to the replacement.
+    """
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    if path.exists():
+        shutil.copymode(path, tmp_path)
+    tmp_path.replace(path)
 
 
 def _write_native_disabled_list(settings_path: Path, disabled_names: set[str]) -> set[str]:
@@ -801,8 +898,7 @@ def _write_native_disabled_list(settings_path: Path, disabled_names: set[str]) -
     previously listed (so the caller can warn about anything that mcpshare
     is about to silently re-enable).
 
-    The write is atomic: data is written to a sibling temp file and then
-    renamed into place.
+    The write is atomic (see :func:`_atomic_write_json`).
     """
     data: dict[str, Any] = {}
     if settings_path.exists():
@@ -815,12 +911,7 @@ def _write_native_disabled_list(settings_path: Path, disabled_names: set[str]) -
         data[NATIVE_DISABLED_KEY] = sorted_names
     else:
         data.pop(NATIVE_DISABLED_KEY, None)
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = settings_path.with_name(settings_path.name + ".tmp")
-    with open(tmp_path, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    tmp_path.replace(settings_path)
+    _atomic_write_json(settings_path, data)
     return previous
 
 
@@ -832,8 +923,8 @@ def _emit_native_disabled(
 ) -> None:
     """Write the native disabled list for *tool* and log drift warnings.
 
-    Helper for :func:`write_claude` and :func:`write_copilot`, whose IDEs
-    track disabled servers in ``settings.json`` → ``disabledMcpServers``.
+    Helper for :func:`write_copilot`, whose IDE tracks disabled servers in
+    ``settings.json`` → ``disabledMcpServers``.
     Warns when mcpshare is about to silently re-enable a server that the
     user had disabled natively in the IDE (mcpshare-owns: it wins, but the
     user gets a clear pointer to the command that would preserve the
@@ -862,8 +953,51 @@ def _emit_native_disabled(
 
 
 def resolve_target_path(tool: str, target_dir: str) -> Path:
-    """Return the full file path for a tool's config inside *target_dir*."""
+    """Return the full file path for a tool's config inside *target_dir*.
+
+    Claude Code is the exception and mirrors Claude's own lookup: its
+    default config dir ``~/.claude`` maps to ``~/.claude.json`` in the home
+    directory, while any other dir (as with ``CLAUDE_CONFIG_DIR``) holds
+    its own ``.claude.json``.
+    """
+    if tool == "claude":
+        claude_dir = Path(target_dir).expanduser()
+        if claude_dir.resolve() == (Path.home() / ".claude").resolve():
+            return Path.home() / TARGET_FILENAMES[tool]
+        return claude_dir / TARGET_FILENAMES[tool]
     return Path(target_dir) / TARGET_FILENAMES[tool]
+
+
+def _cleanup_legacy_claude(target_dir: str) -> None:
+    """Remove what older mcpshare versions wrote into the Claude config dir.
+
+    Those versions wrote ``mcp_servers.json`` plus a ``disabledMcpServers``
+    array in ``settings.json``.  Claude Code reads neither, so both only
+    mislead.  Every other ``settings.json`` key is preserved.
+    """
+    claude_dir = Path(target_dir).expanduser()
+    legacy_path = claude_dir / CLAUDE_LEGACY_FILENAME
+    if legacy_path.exists():
+        legacy_path.unlink()
+        logger.info("Removed legacy %s (never read by Claude Code)", legacy_path)
+
+    settings_path = claude_dir / NATIVE_SETTINGS_FILENAME
+    if not settings_path.exists():
+        return
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except json.JSONDecodeError as exc:
+        logger.error(
+            "Cannot clean up %s (invalid JSON: %s). Leaving file untouched.",
+            settings_path,
+            exc,
+        )
+        return
+    if isinstance(settings, dict) and NATIVE_DISABLED_KEY in settings:
+        del settings[NATIVE_DISABLED_KEY]
+        _atomic_write_json(settings_path, settings)
+        logger.info("Removed legacy %s from %s", NATIVE_DISABLED_KEY, settings_path)
 
 
 def _configs_equal(a: dict[str, Any], b: dict[str, Any]) -> bool:
@@ -972,22 +1106,27 @@ def distribute(config: dict[str, Any], master: dict[str, Any]) -> None:
     ``disabled_names`` kwarg.  Each writer is responsible for applying it
     using whatever native mechanism its IDE supports:
 
-    * **Claude Code / Copilot CLI** — server written to ``mcp_servers.json``
-      / ``mcp-config.json`` as normal; disabled names recorded in
-      ``settings.json`` → ``disabledMcpServers`` (mcpshare-owns: the
-      array is overwritten to exactly match mcpshare's view).
+    * **Claude Code** — servers written to ``mcpServers`` in
+      ``~/.claude.json``; disabled servers are omitted, since Claude has
+      no global disable list.
+    * **Copilot CLI** — server written to ``mcp-config.json`` as normal;
+      disabled names recorded in ``settings.json`` → ``disabledMcpServers``
+      (mcpshare-owns: the array is overwritten to exactly match mcpshare's
+      view).
     * **Codex** — server written with ``enabled = false`` inside its
       ``[mcp_servers.<name>]`` TOML block.
     * **Gemini CLI** — server written to ``mcpServers``; disabled names
       added to ``mcp.excluded`` in the same ``settings.json``.
+    * **Antigravity** — server written to ``mcpServers`` in
+      ``mcp_config.json`` with ``"disabled": true``.
     * **OpenCode** — server written to ``mcp`` with ``"enabled": false``.
     * **VSCode** — ``disabled_names`` is ignored; VSCode has no JSON-level
       disable mechanism, so every server is written enabled.
 
-    For MCP-dedicated target files (claude, vscode, copilot) the existing
-    file is deleted before the writer runs so stale entries can't linger.
-    Shared-purpose target files (codex, gemini, opencode) are left in
-    place and only their MCP section is overwritten.
+    For MCP-dedicated target files (vscode, copilot) the existing file is
+    deleted before the writer runs so stale entries can't linger.
+    Shared-purpose target files (claude, codex, gemini, antigravity,
+    opencode) are left in place and only their MCP section is overwritten.
     """
     servers = master.get("mcpServers", {})
     disabled_data = load_disabled(config["source"])
@@ -1012,6 +1151,8 @@ def distribute(config: dict[str, Any], master: dict[str, Any]) -> None:
             logger.info("\033[33m  ↳ disabled: %s\033[0m", name)
         for reason in skipped:
             logger.info("\033[31m  ↳ skipped %s\033[0m", reason)
+        if tool == "claude":
+            _cleanup_legacy_claude(tcfg["path"])
 
 
 # ---------------------------------------------------------------------------

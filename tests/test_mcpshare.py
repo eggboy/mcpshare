@@ -38,9 +38,13 @@ class TestConfig:
         assert "mode" in cfg
         assert "targets" in cfg
         assert cfg["mode"] == "merge"
-        for tool in ("claude", "vscode", "copilot", "codex", "gemini", "opencode"):
+        for tool in ("claude", "vscode", "copilot", "codex", "gemini", "antigravity", "opencode"):
             assert tool in cfg["targets"]
             assert "path" in cfg["targets"][tool]
+
+    def test_default_claude_target_is_config_dir(self):
+        cfg = mcpshare.default_config()
+        assert cfg["targets"]["claude"]["path"] == str(Path.home() / ".claude")
 
     def test_save_and_load_config(self, tmp_home):
         cfg = {"source": "/tmp/master", "mode": "merge", "targets": {}}
@@ -57,6 +61,27 @@ class TestConfig:
 # ---------------------------------------------------------------------------
 # Master config tests
 # ---------------------------------------------------------------------------
+
+
+class TestResolveTargetPath:
+    def test_claude_default_dir_maps_to_home_claude_json(self, tmp_path, monkeypatch):
+        """~/.claude → ~/.claude.json, where Claude Code keeps user-scope servers."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        result = mcpshare.resolve_target_path("claude", str(tmp_path / ".claude"))
+        assert result == tmp_path / ".claude.json"
+
+    def test_claude_default_dir_with_tilde(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert mcpshare.resolve_target_path("claude", "~/.claude") == tmp_path / ".claude.json"
+
+    def test_claude_custom_dir_holds_its_own_claude_json(self, tmp_path, monkeypatch):
+        """A non-default dir behaves like CLAUDE_CONFIG_DIR: <dir>/.claude.json."""
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        custom = tmp_path / "claude-config"
+        assert mcpshare.resolve_target_path("claude", str(custom)) == custom / ".claude.json"
+
+    def test_other_tools_join_filename(self, tmp_path):
+        assert mcpshare.resolve_target_path("copilot", str(tmp_path)) == tmp_path / "mcp-config.json"
 
 
 class TestMaster:
@@ -120,12 +145,14 @@ class TestReaders:
         assert "another tool" not in result
 
     def test_read_claude(self, tmp_path):
-        path = tmp_path / "settings.json"
-        data = {"mcpServers": {"github": {"command": "npx", "args": ["server-gh"], "env": {}}}}
+        path = tmp_path / ".claude.json"
+        data = {
+            "numStartups": 3,
+            "mcpServers": {"github": {"type": "stdio", "command": "npx", "args": ["server-gh"], "env": {}}},
+        }
         path.write_text(json.dumps(data))
         result = mcpshare.read_claude(path)
-        assert "github" in result
-        assert result["github"]["command"] == "npx"
+        assert result == {"github": {"command": "npx", "args": ["server-gh"], "env": {}}}
 
     def test_read_copilot(self, tmp_path):
         path = tmp_path / "mcp-config.json"
@@ -215,6 +242,30 @@ class TestReaders:
         assert "git" in result
         assert result["git"]["command"] == "uvx"
 
+    def test_read_antigravity(self, tmp_path):
+        path = tmp_path / "mcp_config.json"
+        data = {
+            "mcpServers": {
+                "git": {"command": "uvx", "args": ["mcp-server-git"], "env": {"A": "1"}, "cwd": "/tmp"},
+                "remote": {"serverUrl": "https://example.com/mcp", "headers": {"X-Key": "k"}, "disabled": True},
+            }
+        }
+        path.write_text(json.dumps(data))
+        result = mcpshare.read_antigravity(path)
+        assert result == {
+            "git": {"command": "uvx", "args": ["mcp-server-git"], "env": {"A": "1"}, "cwd": "/tmp"},
+            "remote": {"url": "https://example.com/mcp", "headers": {"X-Key": "k"}},
+        }
+
+    def test_read_antigravity_missing_file(self, tmp_path):
+        assert mcpshare.read_antigravity(tmp_path / "nope") == {}
+
+    def test_read_antigravity_raises_on_invalid_json(self, tmp_path):
+        path = tmp_path / "mcp_config.json"
+        path.write_text("{not valid json")
+        with pytest.raises(mcpshare.ConfigParseError, match="Invalid JSON"):
+            mcpshare.read_antigravity(path)
+
     def test_read_opencode(self, tmp_path):
         path = tmp_path / "opencode.json"
         data = {
@@ -268,11 +319,75 @@ class TestWriters:
         assert data["servers"]["remote"]["type"] == "http"
 
     def test_write_claude(self, tmp_path, sample_servers):
-        path = tmp_path / "mcp_servers.json"
+        path = tmp_path / ".claude.json"
         mcpshare.write_claude(path, sample_servers)
         data = json.loads(path.read_text())
         assert "mcpServers" in data
-        assert "filesystem" in data["mcpServers"]
+        assert data["mcpServers"]["filesystem"]["type"] == "stdio"
+        assert data["mcpServers"]["filesystem"]["command"] == "npx"
+
+    def test_write_claude_http_type_for_url_servers(self, tmp_path):
+        """Claude rejects a remote server without an explicit type."""
+        path = tmp_path / ".claude.json"
+        servers = {"remote": {"url": "https://example.com/mcp", "headers": {"X-Key": "k"}}}
+        mcpshare.write_claude(path, servers)
+        data = json.loads(path.read_text())
+        assert data["mcpServers"]["remote"] == {
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "headers": {"X-Key": "k"},
+        }
+
+    def test_write_claude_preserves_claude_state(self, tmp_path, sample_servers):
+        """Only mcpServers is replaced; Claude's other state in .claude.json survives."""
+        path = tmp_path / ".claude.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "numStartups": 42,
+                    "projects": {"/some/repo": {"allowedTools": [], "mcpServers": {}}},
+                    "mcpServers": {"stale-mcp": {"type": "stdio", "command": "old"}},
+                }
+            )
+        )
+        path.chmod(0o600)
+        mcpshare.write_claude(path, sample_servers)
+        data = json.loads(path.read_text())
+        assert data["numStartups"] == 42
+        assert data["projects"] == {"/some/repo": {"allowedTools": [], "mcpServers": {}}}
+        assert set(data["mcpServers"]) == {"filesystem", "github"}
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert not path.with_name(".claude.json.tmp").exists()
+
+    def test_write_claude_keeps_symlink(self, tmp_path, sample_servers):
+        """A symlinked .claude.json (e.g. from a dotfiles repo) stays a symlink."""
+        real = tmp_path / "dotfiles" / "claude.json"
+        real.parent.mkdir()
+        real.write_text(json.dumps({"numStartups": 1}))
+        link = tmp_path / ".claude.json"
+        link.symlink_to(real)
+        mcpshare.write_claude(link, sample_servers)
+        assert link.is_symlink()
+        data = json.loads(real.read_text())
+        assert data["numStartups"] == 1
+        assert set(data["mcpServers"]) == {"filesystem", "github"}
+
+    def test_write_claude_omits_disabled_servers(self, tmp_path, sample_servers):
+        """Claude has no global disable list, so disabled servers are left out."""
+        path = tmp_path / ".claude.json"
+        count, skipped = mcpshare.write_claude(path, sample_servers, disabled_names={"filesystem"})
+        data = json.loads(path.read_text())
+        assert set(data["mcpServers"]) == {"github"}
+        assert count == 1
+        assert skipped == []
+
+    def test_write_claude_drops_non_claude_keys(self, tmp_path):
+        """Codex 'tools' allow-lists and stray 'disabled' flags are not written."""
+        path = tmp_path / ".claude.json"
+        servers = {"azure-mcp": {"command": "npx", "args": ["-y", "x"], "tools": ["a", "b"], "disabled": True}}
+        mcpshare.write_claude(path, servers)
+        data = json.loads(path.read_text())
+        assert data["mcpServers"]["azure-mcp"] == {"type": "stdio", "command": "npx", "args": ["-y", "x"]}
 
     def test_write_copilot(self, tmp_path, sample_servers):
         path = tmp_path / "mcp-config.json"
@@ -305,6 +420,47 @@ class TestWriters:
         assert data["theme"] == "Dracula"
         assert "mcpServers" in data
 
+    def test_write_antigravity(self, tmp_path, sample_servers):
+        path = tmp_path / "mcp_config.json"
+        mcpshare.write_antigravity(path, sample_servers)
+        data = json.loads(path.read_text())
+        # stdio entries pass through unchanged; Antigravity has no 'type' field.
+        assert data["mcpServers"] == sample_servers
+
+    def test_write_antigravity_server_url_for_url_servers(self, tmp_path):
+        """Antigravity only accepts 'serverUrl' for remote servers, not 'url'."""
+        path = tmp_path / "mcp_config.json"
+        servers = {"remote": {"url": "https://example.com/mcp", "headers": {"X-Key": "k"}}}
+        mcpshare.write_antigravity(path, servers)
+        data = json.loads(path.read_text())
+        assert data["mcpServers"]["remote"] == {"serverUrl": "https://example.com/mcp", "headers": {"X-Key": "k"}}
+
+    def test_write_antigravity_preserves_other_keys(self, tmp_path, sample_servers):
+        path = tmp_path / "mcp_config.json"
+        path.write_text(json.dumps({"futureKey": {"a": 1}, "mcpServers": {"stale-mcp": {"command": "old"}}}))
+        mcpshare.write_antigravity(path, sample_servers)
+        data = json.loads(path.read_text())
+        assert data["futureKey"] == {"a": 1}
+        assert set(data["mcpServers"]) == {"filesystem", "github"}
+
+    def test_write_antigravity_drops_non_antigravity_keys(self, tmp_path):
+        """'type', Codex 'tools' allow-lists and stray 'disabled' flags are not written."""
+        path = tmp_path / "mcp_config.json"
+        servers = {
+            "azure-mcp": {"type": "stdio", "command": "npx", "args": ["-y", "x"], "tools": ["a"], "disabled": True}
+        }
+        mcpshare.write_antigravity(path, servers)
+        data = json.loads(path.read_text())
+        assert data["mcpServers"]["azure-mcp"] == {"command": "npx", "args": ["-y", "x"]}
+
+    def test_write_antigravity_disabled_flag(self, tmp_path, sample_servers):
+        path = tmp_path / "mcp_config.json"
+        count, skipped = mcpshare.write_antigravity(path, sample_servers, disabled_names={"filesystem"})
+        data = json.loads(path.read_text())
+        assert data["mcpServers"]["filesystem"]["disabled"] is True
+        assert "disabled" not in data["mcpServers"]["github"]
+        assert (count, skipped) == (2, [])
+
     def test_write_opencode(self, tmp_path, sample_servers):
         path = tmp_path / "opencode.json"
         mcpshare.write_opencode(path, sample_servers)
@@ -335,9 +491,10 @@ class TestRoundTrip:
         "tool,writer,reader,filename",
         [
             ("vscode", mcpshare.write_vscode, mcpshare.read_vscode, "mcp.json"),
-            ("claude", mcpshare.write_claude, mcpshare.read_claude, "mcp_servers.json"),
+            ("claude", mcpshare.write_claude, mcpshare.read_claude, ".claude.json"),
             ("copilot", mcpshare.write_copilot, mcpshare.read_copilot, "mcp-config.json"),
             ("gemini", mcpshare.write_gemini, mcpshare.read_gemini, "settings.json"),
+            ("antigravity", mcpshare.write_antigravity, mcpshare.read_antigravity, "mcp_config.json"),
             ("opencode", mcpshare.write_opencode, mcpshare.read_opencode, "opencode.json"),
         ],
     )
@@ -346,6 +503,13 @@ class TestRoundTrip:
         writer(path, sample_servers)
         result = reader(path)
         assert result == sample_servers
+
+    def test_round_trip_antigravity_url_server(self, tmp_path):
+        """url → serverUrl on write and serverUrl → url on read."""
+        path = tmp_path / "mcp_config.json"
+        servers = {"remote": {"url": "https://example.com/mcp", "headers": {"X-Key": "k"}}}
+        mcpshare.write_antigravity(path, servers)
+        assert mcpshare.read_antigravity(path) == servers
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +521,7 @@ class TestCollectDistribute:
     def _make_config(self, tmp_path):
         source = str(tmp_path / "master")
         targets = {}
-        for tool in ("claude", "vscode", "copilot", "codex", "gemini", "opencode"):
+        for tool in ("claude", "vscode", "copilot", "codex", "gemini", "antigravity", "opencode"):
             tdir = tmp_path / tool
             tdir.mkdir()
             targets[tool] = {"path": str(tdir)}
@@ -600,7 +764,7 @@ class TestDisabledKeyRemoval:
         assert "disabled" not in result["filesystem"]
 
     def test_read_claude_drops_disabled(self, tmp_path, on_disk_with_disabled):
-        path = tmp_path / "mcp_servers.json"
+        path = tmp_path / ".claude.json"
         path.write_text(json.dumps({"mcpServers": on_disk_with_disabled}))
         result = mcpshare.read_claude(path)
         assert "disabled" not in result["filesystem"]
@@ -958,6 +1122,53 @@ class TestDistributeBehavior:
         )
         assert "filesystem" in vscode_data["servers"]
 
+    # ---- in_file_flag strategy (antigravity) ----
+
+    def test_antigravity_writes_disabled_true(self, tmp_home, tmp_path, sample_servers):
+        config = self._make_config(tmp_path, tools=("antigravity",))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        ag_data = json.loads(
+            mcpshare.resolve_target_path("antigravity", config["targets"]["antigravity"]["path"]).read_text()
+        )
+        # Server stays listed so it can be toggled in Antigravity's UI.
+        assert ag_data["mcpServers"]["filesystem"]["disabled"] is True
+        assert "disabled" not in ag_data["mcpServers"]["github"]
+
+    def test_antigravity_per_ide_disable(self, tmp_home, tmp_path, sample_servers):
+        """An antigravity-only disable entry affects Antigravity alone."""
+        config = self._make_config(tmp_path, tools=("antigravity", "opencode"))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"antigravity": ["filesystem"]})
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        ag_data = json.loads(
+            mcpshare.resolve_target_path("antigravity", config["targets"]["antigravity"]["path"]).read_text()
+        )
+        opencode_data = json.loads(
+            mcpshare.resolve_target_path("opencode", config["targets"]["opencode"]["path"]).read_text()
+        )
+        assert ag_data["mcpServers"]["filesystem"]["disabled"] is True
+        assert "enabled" not in opencode_data["mcp"]["filesystem"]
+
+    def test_master_disabled_flag_is_ignored_by_antigravity(self, tmp_home, tmp_path, sample_servers):
+        """A stray 'disabled: true' on master never reaches mcp_config.json."""
+        config = self._make_config(tmp_path, tools=("antigravity",))
+        mcpshare.save_config(config)
+        seeded = dict(sample_servers)
+        seeded["filesystem"] = dict(seeded["filesystem"], disabled=True)
+
+        mcpshare.distribute(config, {"mcpServers": seeded})
+
+        ag_data = json.loads(
+            mcpshare.resolve_target_path("antigravity", config["targets"]["antigravity"]["path"]).read_text()
+        )
+        assert "disabled" not in ag_data["mcpServers"]["filesystem"]
+
     # ---- in_file_flag strategy (codex) ----
 
     def test_codex_writes_disabled_with_enabled_false(self, tmp_home, tmp_path, sample_servers):
@@ -977,10 +1188,10 @@ class TestDistributeBehavior:
         assert "enabled = false" in fs_block
         assert "enabled = false" not in gh_block
 
-    # ---- settings_json strategy (claude, copilot) ----
+    # ---- omit strategy (claude: ~/.claude.json has no global disable) ----
 
-    def test_claude_writes_disabled_to_settings_json(self, tmp_home, tmp_path, sample_servers):
-        """Disabled servers appear in mcp_servers.json AND in settings.json."""
+    def test_claude_omits_disabled_from_claude_json(self, tmp_home, tmp_path, sample_servers):
+        """Disabled servers are left out of .claude.json; settings.json is not touched."""
         config = self._make_config(tmp_path, tools=("claude",))
         mcpshare.save_config(config)
         mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
@@ -988,14 +1199,77 @@ class TestDistributeBehavior:
         mcpshare.distribute(config, {"mcpServers": sample_servers})
 
         claude_dir = Path(config["targets"]["claude"]["path"])
-        servers_data = json.loads((claude_dir / "mcp_servers.json").read_text())
-        settings_data = json.loads((claude_dir / "settings.json").read_text())
+        claude_data = json.loads((claude_dir / ".claude.json").read_text())
+        assert set(claude_data["mcpServers"]) == {"github"}
+        assert not (claude_dir / "settings.json").exists()
 
-        # Server is written as normal.
-        assert "filesystem" in servers_data["mcpServers"]
-        assert "disabled" not in servers_data["mcpServers"]["filesystem"]
-        # Native disable list reflects mcpshare's view.
-        assert settings_data["disabledMcpServers"] == ["filesystem"]
+    def test_claude_per_ide_disable(self, tmp_home, tmp_path, sample_servers):
+        """A claude-only disable entry omits the server from Claude alone."""
+        config = self._make_config(tmp_path, tools=("claude", "copilot"))
+        mcpshare.save_config(config)
+        mcpshare.save_disabled(config["source"], {"claude": ["filesystem"]})
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        claude_data = json.loads(
+            mcpshare.resolve_target_path("claude", config["targets"]["claude"]["path"]).read_text()
+        )
+        copilot_data = json.loads(
+            mcpshare.resolve_target_path("copilot", config["targets"]["copilot"]["path"]).read_text()
+        )
+        assert "filesystem" not in claude_data["mcpServers"]
+        assert "filesystem" in copilot_data["mcpServers"]
+
+    def test_claude_json_is_merged_not_recreated(self, tmp_home, tmp_path, sample_servers):
+        """distribute must never delete .claude.json: it holds all of Claude's state."""
+        config = self._make_config(tmp_path, tools=("claude",))
+        claude_path = mcpshare.resolve_target_path("claude", config["targets"]["claude"]["path"])
+        claude_path.write_text(
+            json.dumps(
+                {
+                    "numStartups": 7,
+                    "projects": {"/repo": {"disabledMcpServers": ["x-mcp"]}},
+                    "mcpServers": {"stale-mcp": {"type": "stdio", "command": "old"}},
+                }
+            )
+        )
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        data = json.loads(claude_path.read_text())
+        assert data["numStartups"] == 7
+        assert data["projects"] == {"/repo": {"disabledMcpServers": ["x-mcp"]}}
+        assert set(data["mcpServers"]) == {"filesystem", "github"}
+
+    def test_claude_legacy_files_cleaned_up(self, tmp_home, tmp_path, sample_servers):
+        """Old mcp_servers.json and settings.json/disabledMcpServers are removed."""
+        config = self._make_config(tmp_path, tools=("claude",))
+        claude_dir = Path(config["targets"]["claude"]["path"])
+        (claude_dir / "mcp_servers.json").write_text(json.dumps({"mcpServers": {}}))
+        (claude_dir / "settings.json").write_text(
+            json.dumps({"theme": "dark", "disabledMcpServers": ["filesystem"], "permissions": {"allow": []}})
+        )
+
+        mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        assert not (claude_dir / "mcp_servers.json").exists()
+        settings_data = json.loads((claude_dir / "settings.json").read_text())
+        assert settings_data == {"theme": "dark", "permissions": {"allow": []}}
+
+    def test_claude_cleanup_skips_invalid_settings_json(self, tmp_home, tmp_path, sample_servers, caplog):
+        """A malformed settings.json is left untouched and the sync still succeeds."""
+        config = self._make_config(tmp_path, tools=("claude",))
+        claude_dir = Path(config["targets"]["claude"]["path"])
+        (claude_dir / "settings.json").write_text("{not valid json")
+
+        with caplog.at_level("ERROR"):
+            mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        assert (claude_dir / "settings.json").read_text() == "{not valid json"
+        assert "Cannot clean up" in caplog.text
+        assert (claude_dir / ".claude.json").exists()
+
+    # ---- settings_json strategy (copilot) ----
 
     def test_copilot_writes_disabled_to_settings_json(self, tmp_home, tmp_path, sample_servers):
         config = self._make_config(tmp_path, tools=("copilot",))
@@ -1014,42 +1288,42 @@ class TestDistributeBehavior:
 
     def test_settings_json_preserves_unrelated_keys(self, tmp_home, tmp_path, sample_servers):
         """Updating disabledMcpServers must not clobber other settings.json keys."""
-        config = self._make_config(tmp_path, tools=("claude",))
+        config = self._make_config(tmp_path, tools=("copilot",))
         mcpshare.save_config(config)
-        claude_dir = Path(config["targets"]["claude"]["path"])
+        copilot_dir = Path(config["targets"]["copilot"]["path"])
         # Seed settings.json with unrelated keys the user owns.
-        (claude_dir / "settings.json").write_text(json.dumps({"theme": "dark", "permissions": {"allow": ["Read(*)"]}}))
+        (copilot_dir / "settings.json").write_text(json.dumps({"theme": "dark", "permissions": {"allow": ["Read(*)"]}}))
         mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
 
         mcpshare.distribute(config, {"mcpServers": sample_servers})
 
-        settings_data = json.loads((claude_dir / "settings.json").read_text())
+        settings_data = json.loads((copilot_dir / "settings.json").read_text())
         assert settings_data["theme"] == "dark"
         assert settings_data["permissions"] == {"allow": ["Read(*)"]}
         assert settings_data["disabledMcpServers"] == ["filesystem"]
 
     def test_settings_json_overwrites_native_disabled_list(self, tmp_home, tmp_path, sample_servers):
         """mcpshare-owns: the disabledMcpServers array is replaced, not merged."""
-        config = self._make_config(tmp_path, tools=("claude",))
+        config = self._make_config(tmp_path, tools=("copilot",))
         mcpshare.save_config(config)
-        claude_dir = Path(config["targets"]["claude"]["path"])
+        copilot_dir = Path(config["targets"]["copilot"]["path"])
         # User had a different server disabled natively.
-        (claude_dir / "settings.json").write_text(json.dumps({"disabledMcpServers": ["github", "some-orphan"]}))
+        (copilot_dir / "settings.json").write_text(json.dumps({"disabledMcpServers": ["github", "some-orphan"]}))
         # mcpshare disables only filesystem; github stays enabled.
         mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
 
         mcpshare.distribute(config, {"mcpServers": sample_servers})
 
-        settings_data = json.loads((claude_dir / "settings.json").read_text())
+        settings_data = json.loads((copilot_dir / "settings.json").read_text())
         assert settings_data["disabledMcpServers"] == ["filesystem"]
 
     def test_settings_json_re_enable_warning(self, tmp_home, tmp_path, sample_servers, caplog):
         """When mcpshare re-enables a natively-disabled server, log a warning."""
-        config = self._make_config(tmp_path, tools=("claude",))
+        config = self._make_config(tmp_path, tools=("copilot",))
         mcpshare.save_config(config)
-        claude_dir = Path(config["targets"]["claude"]["path"])
-        # User had 'github' disabled natively in Claude.
-        (claude_dir / "settings.json").write_text(json.dumps({"disabledMcpServers": ["github"]}))
+        copilot_dir = Path(config["targets"]["copilot"]["path"])
+        # User had 'github' disabled natively in Copilot.
+        (copilot_dir / "settings.json").write_text(json.dumps({"disabledMcpServers": ["github"]}))
         # mcpshare doesn't know about that disable.
         with caplog.at_level("WARNING"):
             mcpshare.distribute(config, {"mcpServers": sample_servers})
@@ -1057,14 +1331,14 @@ class TestDistributeBehavior:
 
     def test_settings_json_removed_when_no_disabled(self, tmp_home, tmp_path, sample_servers):
         """If no servers are disabled, the disabledMcpServers key is removed."""
-        config = self._make_config(tmp_path, tools=("claude",))
+        config = self._make_config(tmp_path, tools=("copilot",))
         mcpshare.save_config(config)
-        claude_dir = Path(config["targets"]["claude"]["path"])
-        (claude_dir / "settings.json").write_text(json.dumps({"theme": "dark"}))
+        copilot_dir = Path(config["targets"]["copilot"]["path"])
+        (copilot_dir / "settings.json").write_text(json.dumps({"theme": "dark"}))
 
         mcpshare.distribute(config, {"mcpServers": sample_servers})
 
-        settings_data = json.loads((claude_dir / "settings.json").read_text())
+        settings_data = json.loads((copilot_dir / "settings.json").read_text())
         assert "disabledMcpServers" not in settings_data
         assert settings_data["theme"] == "dark"
 
@@ -1088,6 +1362,19 @@ class TestDistributeBehavior:
 
     def test_master_disabled_flag_is_ignored_settings_json_strategy(self, tmp_home, tmp_path, sample_servers):
         """A stray 'disabled: true' on master never reaches settings.json."""
+        config = self._make_config(tmp_path, tools=("copilot",))
+        mcpshare.save_config(config)
+        seeded = dict(sample_servers)
+        seeded["filesystem"] = dict(seeded["filesystem"], disabled=True)
+
+        mcpshare.distribute(config, {"mcpServers": seeded})
+
+        copilot_dir = Path(config["targets"]["copilot"]["path"])
+        settings_path = copilot_dir / "settings.json"
+        assert not settings_path.exists() or "disabledMcpServers" not in json.loads(settings_path.read_text())
+
+    def test_master_disabled_flag_is_ignored_by_claude(self, tmp_home, tmp_path, sample_servers):
+        """A stray 'disabled: true' on master neither omits the server nor reaches .claude.json."""
         config = self._make_config(tmp_path, tools=("claude",))
         mcpshare.save_config(config)
         seeded = dict(sample_servers)
@@ -1095,9 +1382,11 @@ class TestDistributeBehavior:
 
         mcpshare.distribute(config, {"mcpServers": seeded})
 
-        claude_dir = Path(config["targets"]["claude"]["path"])
-        settings_path = claude_dir / "settings.json"
-        assert not settings_path.exists() or "disabledMcpServers" not in json.loads(settings_path.read_text())
+        claude_data = json.loads(
+            mcpshare.resolve_target_path("claude", config["targets"]["claude"]["path"]).read_text()
+        )
+        assert "filesystem" in claude_data["mcpServers"]
+        assert "disabled" not in claude_data["mcpServers"]["filesystem"]
 
     def test_disabled_persists_across_sync_after_master_regen(self, tmp_home, tmp_path, sample_servers):
         """Core scenario: master is wiped and regenerated; mcp.disabled.yaml still hides it."""

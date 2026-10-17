@@ -4,6 +4,7 @@
 [![Codex](https://img.shields.io/badge/Codex-supported-blueviolet.svg)](#supported-formats)
 [![GitHub Copilot](https://img.shields.io/badge/GitHub_Copilot-supported-blueviolet.svg)](#supported-formats)
 [![Gemini](https://img.shields.io/badge/Gemini-supported-blueviolet.svg)](#supported-formats)
+[![Antigravity](https://img.shields.io/badge/Antigravity-supported-blueviolet.svg)](#supported-formats)
 [![opencode](https://img.shields.io/badge/opencode-supported-blueviolet.svg)](#supported-formats)
 [![VSCode](https://img.shields.io/badge/VSCode-supported-blueviolet.svg)](#supported-formats)
 
@@ -11,7 +12,7 @@ CLI tool to share MCP configuration between coding agents.
 
 Synchronizes [Model Context Protocol](https://modelcontextprotocol.io/) server
 definitions across **VSCode**, **GitHub Copilot CLI**, **Claude Code**,
-**OpenAI Codex**, **Google Gemini CLI**, and **OpenCode**.
+**OpenAI Codex**, **Google Gemini CLI**, **Google Antigravity**, and **OpenCode**.
 
 ## Quick start
 
@@ -52,6 +53,8 @@ targets:
     path: ~/.codex
   gemini:
     path: ~/.gemini
+  antigravity:
+    path: ~/.gemini/config
   opencode:
     path: ~/.config/opencode
 ```
@@ -116,21 +119,24 @@ codex:
 `sync` writes every master server to every configured IDE. For disabled
 servers, mcpshare uses each IDE's **native** disable mechanism rather than
 omitting the entry (so the server stays visible and can be re-enabled in the
-tool's UI without round-tripping through `mcpshare enable`).
+tool's UI without round-tripping through `mcpshare enable`). Claude Code is
+the exception: it has no global disable list, so disabled servers are left
+out of its config.
 
 | IDE | Native disable mechanism | What `sync` writes |
 |-----|--------------------------|--------------------|
 | Codex | `enabled = false` in the server's TOML block | Server written with `enabled = false` |
-| Claude Code | `disabledMcpServers: [...]` in `~/.claude/settings.json` | Server in `mcp_servers.json` **plus** name in `settings.json` array |
+| Claude Code | None global (`/mcp` toggles are stored per project in `~/.claude.json`) | Server **omitted** from `mcpServers` in `~/.claude.json` |
 | Copilot CLI | `disabledMcpServers: [...]` in `~/.copilot/settings.json` | Server in `mcp-config.json` **plus** name in `settings.json` array |
 | Gemini CLI | `mcp.excluded: [...]` in `~/.gemini/settings.json` (security-grade blocklist) | Server in `mcpServers` **plus** name in `mcp.excluded` (same file) |
+| Antigravity | `"disabled": true` per entry in `~/.gemini/config/mcp_config.json` | Server written with `"disabled": true` |
 | OpenCode | `"enabled": false` per entry in `opencode.json` | Server written with `"enabled": false` |
 | VSCode | None (UI-only per profile) | Server is always written enabled. `disable --ide vscode` is recorded but warns and is a no-op on sync. |
 
 **Source of truth: mcpshare-owns.** On each `sync`, mcpshare *replaces*
-the `disabledMcpServers` array in Claude/Copilot `settings.json` with its
-own view (other settings.json keys are preserved). If you previously ran
-`/mcp disable foo` natively inside Claude or Copilot, the next `sync` will
+the `disabledMcpServers` array in Copilot `settings.json` with its own
+view (other settings.json keys are preserved). If you previously ran
+`/mcp disable foo` natively inside Copilot, the next `sync` will
 re-enable `foo` and log a warning telling you the exact `mcpshare disable`
 command to run if you want to keep it disabled.
 
@@ -140,13 +146,49 @@ all other keys in the target files are preserved.
 
 ### Sync semantics
 
-For MCP-dedicated target files (`mcp.json`, `mcp_servers.json`,
-`mcp-config.json`), `sync` **deletes the file and recreates it** so removed
-servers cannot linger. For files shared with other IDE settings
-(`config.toml`, `settings.json`, `opencode.json`), only the MCP section is
-replaced — non-MCP content is preserved. For Claude/Copilot, the
+For MCP-dedicated target files (`mcp.json`, `mcp-config.json`), `sync`
+**deletes the file and recreates it** so removed servers cannot linger.
+For files shared with other IDE settings (`.claude.json`, `config.toml`,
+`settings.json`, `mcp_config.json`, `opencode.json`), only the MCP section
+is replaced — non-MCP content is preserved. For Copilot, the
 `disabledMcpServers` array in `settings.json` is also overwritten in place
 while preserving every other key.
+
+#### Claude Code
+
+Claude Code reads user-scope MCP servers only from the top-level
+`mcpServers` object in `~/.claude.json` (the same place
+`claude mcp add --scope user` writes). The configured target stays
+`~/.claude`, Claude's config dir; mcpshare resolves it the way Claude does,
+so `~/.claude` maps to `~/.claude.json` and any other directory (as with
+`CLAUDE_CONFIG_DIR`) maps to `<dir>/.claude.json`.
+
+- Only `mcpServers` is replaced, atomically; the rest of `~/.claude.json`
+  is Claude's own state and is left alone.
+- Each entry gets `"type": "stdio"` or `"type": "http"`. Claude rejects a
+  remote server without a type.
+- Codex-only `tools` allow-lists are not written.
+- Restart running Claude Code sessions after `sync` to pick up the change.
+
+Versions before 0.17.1 wrote `~/.claude/mcp_servers.json` and a
+`disabledMcpServers` array in `~/.claude/settings.json`. Claude reads
+neither, so `sync` now deletes that file and removes that one key (other
+`settings.json` keys are kept).
+
+#### Antigravity
+
+The Antigravity app, IDE, and CLI (`agy`) share one global file,
+`~/.gemini/config/mcp_config.json`, so the target path is
+`~/.gemini/config`. Older locations (`~/.gemini/antigravity/` and
+`~/.gemini/antigravity-cli/`) are not written.
+
+- Remote servers are written with `serverUrl`, the only key Antigravity
+  accepts (`url` fails only when a tool is first called).
+- No `type` field is written; Codex-only `tools` allow-lists are dropped.
+- Disabled servers stay listed with `"disabled": true`, so they can be
+  toggled from Antigravity's UI.
+- After `sync`, click **Refresh** under Installed MCP Servers in the app,
+  or reload from `/mcp` in `agy`.
 
 ### Conflict resolution on pull
 
@@ -163,11 +205,12 @@ with a warning.
 
 | Tool | File | Top-level key | Notes |
 |------|------|---------------|-------|
-| Claude Code | `mcp_servers.json` | `mcpServers` | MCP-dedicated; recreated on sync. Disable via `settings.json` |
+| Claude Code | `~/.claude.json` | `mcpServers` | Shared with Claude's state; only `mcpServers` is replaced. Adds `"type"`. Disabled servers omitted |
 | VSCode | `mcp.json` | `servers` | MCP-dedicated; recreated on sync. Adds `"type": "stdio"`. No native disable |
 | Copilot CLI | `mcp-config.json` | `mcpServers` | MCP-dedicated; recreated on sync. Adds `"type": "stdio"`. Disable via `settings.json` |
 | Codex | `config.toml` | `[mcp_servers.*]` | TOML; preserves non-MCP sections. Native `enabled = false` |
 | Gemini CLI | `settings.json` | `mcpServers` | Preserves non-MCP settings. Disable via `mcp.excluded` (same file) |
+| Antigravity | `~/.gemini/config/mcp_config.json` | `mcpServers` | `url` written as `serverUrl`; no `type`; Codex `tools` not written. Native `"disabled": true` per entry |
 | OpenCode | `opencode.json` | `mcp` | Uses `command` array, `environment`. Native `"enabled": false` per entry |
 
 ## Development
