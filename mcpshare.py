@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import sys
+import tomllib
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,11 +57,10 @@ DISABLED_FILENAME = "mcp.disabled.yaml"
 # Sentinel key inside the disabled file for "all configured IDEs".
 DISABLED_ALL = "*"
 
-# Tools whose target file holds nothing but MCP servers. For these we
-# delete-and-recreate during sync so stale entries can never linger.
-# Tools NOT in this set share the file with unrelated IDE settings, so
-# we only overwrite the MCP section within the file.
-MCP_DEDICATED_TOOLS = frozenset({"vscode", "copilot"})
+# Config key listing which tools ``mcpshare pull`` collects servers from, and
+# the default list used by ``mcpshare init`` (and when older configs omit it).
+INIT_SOURCE_KEY = "init-source"
+DEFAULT_INIT_SOURCES = ("vscode", "copilot")
 
 # Filename of the native settings file (relative to the target directory)
 # used by Copilot CLI for its ``disabledMcpServers`` array.
@@ -152,11 +152,41 @@ TARGET_FILENAMES = {
 }
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write *content* to *path* atomically.
+
+    Content goes to a sibling temp file that is then renamed into place, so a
+    reader never sees a half-written file.  A symlinked *path* is written
+    through to its target, and an existing file's permission bits carry over
+    to the replacement before any bytes hit disk.
+    """
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            if path.exists():
+                shutil.copymode(path, tmp_path)
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_path.replace(path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write *data* as formatted JSON to *path* atomically."""
+    _atomic_write_text(path, json.dumps(data, indent=2) + "\n")
+
+
 def default_config() -> dict[str, Any]:
     """Return a default configuration."""
     source = str(CONFIG_DIR / "master")
     return {
         "source": source,
+        INIT_SOURCE_KEY: list(DEFAULT_INIT_SOURCES),
         "mode": "merge",
         "targets": {
             "claude": {"path": str(CLAUDE_CONFIG_DIR)},
@@ -172,23 +202,49 @@ def default_config() -> dict[str, Any]:
     }
 
 
+def _resolve_init_sources(config: dict[str, Any]) -> list[str]:
+    """Return the ordered, deduplicated list of tools ``mcpshare pull`` reads from.
+
+    Reads ``init-source`` from *config*.  When the key is absent (as in
+    configs created by older versions), falls back to
+    :data:`DEFAULT_INIT_SOURCES` filtered to the configured ``targets``.
+
+    Raises:
+        ConfigParseError: If ``init-source`` is present and not a list of strings.
+    """
+    targets = config.get("targets", {})
+    if INIT_SOURCE_KEY not in config:
+        return [tool for tool in DEFAULT_INIT_SOURCES if tool in targets]
+    raw = config[INIT_SOURCE_KEY]
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ConfigParseError(f"Expected list of tool names under '{INIT_SOURCE_KEY}' in {CONFIG_FILE}")
+    return list(dict.fromkeys(raw))
+
+
 def load_config() -> dict[str, Any]:
     """Load configuration from the config file.
 
     Raises:
         ConfigNotFoundError: If the config file does not exist.
+        ConfigParseError: If the config file contains invalid YAML.
     """
     if not CONFIG_FILE.exists():
         raise ConfigNotFoundError(f"Config not found: {CONFIG_FILE}. Run 'mcpshare init' to create one.")
-    with open(CONFIG_FILE) as f:
-        return yaml.safe_load(f)
+    try:
+        with open(CONFIG_FILE) as f:
+            data = yaml.safe_load(f) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigParseError(f"Invalid YAML in {CONFIG_FILE}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigParseError(f"Expected mapping at top of {CONFIG_FILE}, got {type(data).__name__}")
+    return data
 
 
 def save_config(config: dict[str, Any]) -> None:
-    """Save configuration to the config file."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    """Save configuration to the config file atomically."""
+    _atomic_write_text(CONFIG_FILE, yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +312,7 @@ def load_disabled(source_dir: str) -> dict[str, list[str]]:
 
 
 def save_disabled(source_dir: str, data: dict[str, list[str]]) -> None:
-    """Persist the per-IDE disabled-servers list next to the master."""
+    """Persist the per-IDE disabled-servers list next to the master atomically."""
     path = disabled_file_path(source_dir)
     # Drop empty entries so the file stays tidy.
     clean = {k: sorted(v) for k, v in data.items() if v}
@@ -264,14 +320,43 @@ def save_disabled(source_dir: str, data: dict[str, list[str]]) -> None:
         if path.exists():
             path.unlink()
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        yaml.dump(clean, f, default_flow_style=False, sort_keys=True)
+    _atomic_write_text(path, yaml.dump(clean, default_flow_style=False, sort_keys=True))
 
 
 def disabled_for_tool(data: dict[str, list[str]], tool: str) -> set[str]:
     """Return the set of servers disabled for *tool* (global ``*`` ∪ tool-specific)."""
     return set(data.get(DISABLED_ALL, [])) | set(data.get(tool, []))
+
+
+# ---------------------------------------------------------------------------
+# JSON file helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    """Load *path* as a JSON object, treating a missing or empty file as ``{}``.
+
+    Some tools create their config file as an empty placeholder before any
+    setting is written to it (Antigravity does this with ``mcp_config.json``).
+    An empty file holds nothing worth preserving, so it is read as an empty
+    object instead of being rejected as invalid JSON.
+
+    Raises:
+        ConfigParseError: If the file contains invalid JSON, or its top-level
+            value is not an object (nothing could be merged into it safely).
+    """
+    if not path.exists():
+        return {}
+    text = path.read_text()
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ConfigParseError(f"Invalid JSON in {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigParseError(f"Expected JSON object at top of {path}, got {type(data).__name__}")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -282,17 +367,12 @@ def disabled_for_tool(data: dict[str, list[str]], tool: str) -> set[str]:
 def load_master(source_dir: str) -> dict[str, Any]:
     """Load the master MCP config from the source directory.
 
+    A missing or empty master file yields an empty server map.
+
     Raises:
         ConfigParseError: If the master file contains invalid JSON.
     """
-    master_path = Path(source_dir) / MASTER_FILENAME
-    if not master_path.exists():
-        return {"mcpServers": {}}
-    try:
-        with open(master_path) as f:
-            data = json.load(f)
-    except json.JSONDecodeError as exc:
-        raise ConfigParseError(f"Invalid JSON in {master_path}: {exc}") from exc
+    data = _load_json_object(Path(source_dir) / MASTER_FILENAME)
     if "mcpServers" not in data:
         data["mcpServers"] = {}
     # Normalize any multi-word command strings so the executable is separated
@@ -306,18 +386,13 @@ def load_master(source_dir: str) -> dict[str, Any]:
 
 
 def save_master(source_dir: str, master: dict[str, Any]) -> None:
-    """Save the master MCP config to the source directory.
+    """Save the master MCP config to the source directory atomically.
 
     Server entries are written as-is. Disable state is tracked exclusively in
     ``mcp.disabled.yaml`` (see :func:`load_disabled`); the master never
     carries a per-entry ``disabled`` flag.
     """
-    source_path = Path(source_dir)
-    source_path.mkdir(parents=True, exist_ok=True)
-    master_path = source_path / MASTER_FILENAME
-    with open(master_path, "w") as f:
-        json.dump(master, f, indent=2)
-        f.write("\n")
+    _atomic_write_json(Path(source_dir) / MASTER_FILENAME, master)
 
 
 def read_vscode(path: Path) -> dict[str, Any]:
@@ -329,13 +404,7 @@ def read_vscode(path: Path) -> dict[str, Any]:
     Raises:
         ConfigParseError: If the file contains invalid JSON.
     """
-    if not path.exists():
-        return {}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except json.JSONDecodeError as exc:
-        raise ConfigParseError(f"Invalid JSON in {path}: {exc}") from exc
+    data = _load_json_object(path)
     servers = data.get("servers", {})
     result: dict[str, Any] = {}
     for name, cfg in servers.items():
@@ -359,13 +428,7 @@ def read_claude(path: Path) -> dict[str, Any]:
     Raises:
         ConfigParseError: If the file contains invalid JSON.
     """
-    if not path.exists():
-        return {}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except json.JSONDecodeError as exc:
-        raise ConfigParseError(f"Invalid JSON in {path}: {exc}") from exc
+    data = _load_json_object(path)
     servers = data.get("mcpServers", {})
     return {name: {k: v for k, v in cfg.items() if k not in _READER_DROPPED_KEYS} for name, cfg in servers.items()}
 
@@ -378,13 +441,7 @@ def read_copilot(path: Path) -> dict[str, Any]:
     Raises:
         ConfigParseError: If the file contains invalid JSON.
     """
-    if not path.exists():
-        return {}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except json.JSONDecodeError as exc:
-        raise ConfigParseError(f"Invalid JSON in {path}: {exc}") from exc
+    data = _load_json_object(path)
     servers = data.get("mcpServers", {})
     result: dict[str, Any] = {}
     for name, cfg in servers.items():
@@ -417,8 +474,6 @@ def _flatten_nested_servers(data: dict[str, Any], prefix: str = "") -> dict[str,
 
 def _parse_toml_mcp_servers(text: str) -> dict[str, Any]:
     """Parse MCP servers from a TOML config string (Codex format)."""
-    import tomllib
-
     data = tomllib.loads(text)
     servers = data.get("mcp_servers", {})
     return _flatten_nested_servers(servers)
@@ -430,14 +485,23 @@ def read_codex(path: Path) -> dict[str, Any]:
     Codex uses TOML with ``[mcp_servers.<name>]`` sections.  Any
     ``enabled`` field is dropped — disable state is tracked exclusively in
     ``mcp.disabled.yaml`` and not propagated through readers.  Codex
-    ``tools`` maps are converted back to lists for the canonical format.
+    ``tools`` maps are converted back to lists and ``http_headers`` back to
+    ``headers`` for the canonical format.
+
+    Raises:
+        ConfigParseError: If the file contains invalid TOML.
     """
     if not path.exists():
         return {}
     text = path.read_text()
-    servers = _parse_toml_mcp_servers(text)
+    try:
+        servers = _parse_toml_mcp_servers(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigParseError(f"Invalid TOML in {path}: {exc}") from exc
     for cfg in servers.values():
         cfg.pop("enabled", None)
+        if "http_headers" in cfg:
+            cfg["headers"] = cfg.pop("http_headers")
         tools = cfg.get("tools")
         if isinstance(tools, dict):
             cfg["tools"] = list(tools.keys())
@@ -452,13 +516,7 @@ def read_gemini(path: Path) -> dict[str, Any]:
     Raises:
         ConfigParseError: If the file contains invalid JSON.
     """
-    if not path.exists():
-        return {}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except json.JSONDecodeError as exc:
-        raise ConfigParseError(f"Invalid JSON in {path}: {exc}") from exc
+    data = _load_json_object(path)
     servers = data.get("mcpServers", {})
     return {name: {k: v for k, v in cfg.items() if k not in _READER_DROPPED_KEYS} for name, cfg in servers.items()}
 
@@ -472,13 +530,7 @@ def read_antigravity(path: Path) -> dict[str, Any]:
     Raises:
         ConfigParseError: If the file contains invalid JSON.
     """
-    if not path.exists():
-        return {}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except json.JSONDecodeError as exc:
-        raise ConfigParseError(f"Invalid JSON in {path}: {exc}") from exc
+    data = _load_json_object(path)
     servers = data.get("mcpServers", {})
     return {
         name: {("url" if k == "serverUrl" else k): v for k, v in cfg.items() if k not in _READER_DROPPED_KEYS}
@@ -489,27 +541,29 @@ def read_antigravity(path: Path) -> dict[str, Any]:
 def read_opencode(path: Path) -> dict[str, Any]:
     """Read MCP servers from OpenCode opencode.json.
 
-    OpenCode uses ``{"mcp": {"name": {"type": "local", "command": [...], "environment": {}}}}``.
+    OpenCode uses ``{"mcp": {"name": {"type": "local", "command": [...], "environment": {}}}}``
+    for stdio servers and ``{"type": "remote", "url": ..., "headers": {...}}``
+    for remote servers.  Any ``enabled`` flag is ignored.
 
     Raises:
         ConfigParseError: If the file contains invalid JSON.
     """
-    if not path.exists():
-        return {}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except json.JSONDecodeError as exc:
-        raise ConfigParseError(f"Invalid JSON in {path}: {exc}") from exc
+    data = _load_json_object(path)
     mcp = data.get("mcp", {})
     result: dict[str, Any] = {}
     for name, cfg in mcp.items():
-        entry: dict = {}
-        cmd_list = cfg.get("command", [])
-        if isinstance(cmd_list, list) and cmd_list:
-            entry["command"] = cmd_list[0]
-            if len(cmd_list) > 1:
-                entry["args"] = cmd_list[1:]
+        entry: dict[str, Any] = {}
+        if "url" in cfg:
+            entry["url"] = cfg["url"]
+            headers = cfg.get("headers")
+            if headers is not None:
+                entry["headers"] = headers
+        else:
+            cmd_list = cfg.get("command", [])
+            if isinstance(cmd_list, list) and cmd_list:
+                entry["command"] = cmd_list[0]
+                if len(cmd_list) > 1:
+                    entry["args"] = cmd_list[1:]
         env = cfg.get("environment")
         if env is not None:
             entry["env"] = env
@@ -518,13 +572,13 @@ def read_opencode(path: Path) -> dict[str, Any]:
 
 
 READERS = {
-    # "claude": read_claude,
+    "claude": read_claude,
     "vscode": read_vscode,
     "copilot": read_copilot,
-    # "codex": read_codex,
-    # "gemini": read_gemini,
-    # "antigravity": read_antigravity,
-    # "opencode": read_opencode,
+    "codex": read_codex,
+    "gemini": read_gemini,
+    "antigravity": read_antigravity,
+    "opencode": read_opencode,
 }
 
 
@@ -547,29 +601,38 @@ def _resolve_vscode_vars(value: object) -> object:
     return value
 
 
+def _prefer_vscode_vars(a: Any, b: Any) -> Any:
+    """Given two values equal after ``${env:VAR}`` expansion, keep ``${env:VAR}`` placeholders."""
+    if isinstance(a, str) and isinstance(b, str):
+        return a if _VSCODE_ENV_RE.search(a) else b
+    if isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
+        return [_prefer_vscode_vars(x, y) for x, y in zip(a, b, strict=True)]
+    if isinstance(a, dict) and isinstance(b, dict) and a.keys() == b.keys():
+        return {k: _prefer_vscode_vars(a[k], b[k]) for k in a}
+    return a
+
+
 def write_vscode(path: Path, servers: dict[str, Any], **_: Any) -> tuple[int, list[str]]:
     """Write MCP servers in VSCode format.
 
     Produces ``{"servers": {"name": {"type": "stdio"|"http", ...}}}``.
     The type is determined by the server configuration: ``"http"`` for
-    URL-based servers and ``"stdio"`` for command-based servers.
+    URL-based servers and ``"stdio"`` for command-based servers.  Other
+    top-level keys (such as VSCode's ``inputs`` array) are preserved.
 
     Returns a tuple of (server count, list of skipped server descriptions).
+
+    Raises:
+        ConfigParseError: If an existing file at *path* is not valid JSON.
     """
-    existing = {}
-    if path.exists():
-        with open(path) as f:
-            existing = json.load(f)
+    existing = _load_json_object(path)
     vscode_servers = {}
     for name, cfg in servers.items():
         entry = {"type": _server_type(cfg)}
         entry.update(cfg)
         vscode_servers[name] = entry
     existing["servers"] = vscode_servers
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(existing, f, indent=2)
-        f.write("\n")
+    _atomic_write_json(path, existing)
     return len(vscode_servers), []
 
 
@@ -591,12 +654,12 @@ def write_claude(
     *disabled_names* are left out of ``mcpServers`` entirely.
 
     Returns a tuple of (server count, list of skipped server descriptions).
+
+    Raises:
+        ConfigParseError: If an existing file at *path* is not valid JSON.
     """
     disabled = set(disabled_names)
-    existing = {}
-    if path.exists():
-        with open(path) as f:
-            existing = json.load(f)
+    existing = _load_json_object(path)
     claude_servers = {}
     for name, cfg in servers.items():
         if name in disabled:
@@ -623,11 +686,11 @@ def write_copilot(
     here as the IDE-native disable mechanism).
 
     Returns a tuple of (server count, list of skipped server descriptions).
+
+    Raises:
+        ConfigParseError: If an existing file at *path* is not valid JSON.
     """
-    existing = {}
-    if path.exists():
-        with open(path) as f:
-            existing = json.load(f)
+    existing = _load_json_object(path)
     # Copilot CLI ships with its own GitHub MCP server, so skip any entry
     # pointing at the built-in endpoint (but keep github_spaces and others).
     copilot_servers = {}
@@ -640,10 +703,7 @@ def write_copilot(
         entry.update(cfg)
         copilot_servers[name] = entry
     existing["mcpServers"] = copilot_servers
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(existing, f, indent=2)
-        f.write("\n")
+    _atomic_write_json(path, existing)
     _emit_native_disabled(
         "copilot",
         path.parent / NATIVE_SETTINGS_FILENAME,
@@ -702,12 +762,20 @@ def write_codex(
     the key Codex expects for HTTP transport headers.
 
     Returns a tuple of (server count, list of skipped server descriptions).
+
+    Raises:
+        ConfigParseError: If an existing file at *path* is not valid TOML.
     """
     disabled = set(disabled_names)
     existing_lines: list[str] = []
     if path.exists():
+        text = path.read_text()
+        try:
+            tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigParseError(f"Invalid TOML in {path}: {exc}") from exc
         in_mcp = False
-        for line in path.read_text().splitlines():
+        for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith("[mcp_servers.") or stripped == "[mcp_servers]":
                 in_mcp = True
@@ -734,8 +802,7 @@ def write_codex(
             parts.append(f"{codex_key} = {_format_toml_value(val)}")
     parts.append("")
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(parts))
+    _atomic_write_text(path, "\n".join(parts))
     return len(servers), []
 
 
@@ -752,11 +819,11 @@ def write_gemini(
     keys are preserved.
 
     Returns a tuple of (server count, list of skipped server descriptions).
+
+    Raises:
+        ConfigParseError: If an existing file at *path* is not valid JSON.
     """
-    existing = {}
-    if path.exists():
-        with open(path) as f:
-            existing = json.load(f)
+    existing = _load_json_object(path)
     existing["mcpServers"] = dict(servers)
 
     mcp_section = existing.get("mcp")
@@ -772,10 +839,7 @@ def write_gemini(
     else:
         existing.pop("mcp", None)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(existing, f, indent=2)
-        f.write("\n")
+    _atomic_write_json(path, existing)
     return len(servers), []
 
 
@@ -795,15 +859,16 @@ def write_antigravity(
     emitted as ``serverUrl``, the only remote-server key Antigravity
     accepts.  Names in *disabled_names* receive ``"disabled": true``
     (Antigravity's native per-entry disable flag).  Other top-level keys
-    are preserved.
+    are preserved.  Antigravity creates ``mcp_config.json`` as an empty
+    file until the user adds a server, which is treated as an empty object.
 
     Returns a tuple of (server count, list of skipped server descriptions).
+
+    Raises:
+        ConfigParseError: If an existing file at *path* is not valid JSON.
     """
     disabled = set(disabled_names)
-    existing = {}
-    if path.exists():
-        with open(path) as f:
-            existing = json.load(f)
+    existing = _load_json_object(path)
     ag_servers = {}
     for name, cfg in servers.items():
         entry = {("serverUrl" if k == "url" else k): v for k, v in cfg.items() if k not in _ANTIGRAVITY_DROPPED_KEYS}
@@ -828,12 +893,12 @@ def write_opencode(
     Preserves existing non-MCP settings.
 
     Returns a tuple of (server count, list of skipped server descriptions).
+
+    Raises:
+        ConfigParseError: If an existing file at *path* is not valid JSON.
     """
     disabled = set(disabled_names)
-    existing = {}
-    if path.exists():
-        with open(path) as f:
-            existing = json.load(f)
+    existing = _load_json_object(path)
     oc_servers = {}
     for name, cfg in servers.items():
         if "url" in cfg:
@@ -853,10 +918,7 @@ def write_opencode(
             entry["enabled"] = False
         oc_servers[name] = entry
     existing["mcp"] = oc_servers
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(existing, f, indent=2)
-        f.write("\n")
+    _atomic_write_json(path, existing)
     return len(oc_servers), []
 
 
@@ -871,25 +933,6 @@ WRITERS = {
 }
 
 
-def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    """Write *data* as JSON to *path* atomically.
-
-    Data goes to a sibling temp file that is then renamed into place, so a
-    reader never sees a half-written file.  A symlinked *path* is written
-    through to its target, and an existing file's permission bits carry
-    over to the replacement.
-    """
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + ".tmp")
-    with open(tmp_path, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    if path.exists():
-        shutil.copymode(path, tmp_path)
-    tmp_path.replace(path)
-
-
 def _write_native_disabled_list(settings_path: Path, disabled_names: set[str]) -> set[str]:
     """Set the top-level ``disabledMcpServers`` array in *settings_path*.
 
@@ -899,11 +942,11 @@ def _write_native_disabled_list(settings_path: Path, disabled_names: set[str]) -
     is about to silently re-enable).
 
     The write is atomic (see :func:`_atomic_write_json`).
+
+    Raises:
+        ConfigParseError: If an existing *settings_path* is not valid JSON.
     """
-    data: dict[str, Any] = {}
-    if settings_path.exists():
-        with open(settings_path) as f:
-            data = json.load(f) or {}
+    data = _load_json_object(settings_path)
     previous_raw = data.get(NATIVE_DISABLED_KEY, [])
     previous = {str(item) for item in previous_raw} if isinstance(previous_raw, list) else set()
     sorted_names = sorted(disabled_names)
@@ -932,9 +975,9 @@ def _emit_native_disabled(
     """
     try:
         previous = _write_native_disabled_list(settings_path, disabled_to_emit)
-    except json.JSONDecodeError as exc:
+    except ConfigParseError as exc:
         logger.error(
-            "Cannot update %s (invalid JSON: %s). Leaving file untouched.",
+            "Cannot update %s (%s). Leaving file untouched.",
             settings_path,
             exc,
         )
@@ -982,27 +1025,48 @@ def _cleanup_legacy_claude(target_dir: str) -> None:
         logger.info("Removed legacy %s (never read by Claude Code)", legacy_path)
 
     settings_path = claude_dir / NATIVE_SETTINGS_FILENAME
-    if not settings_path.exists():
-        return
     try:
-        with open(settings_path) as f:
-            settings = json.load(f)
-    except json.JSONDecodeError as exc:
+        settings = _load_json_object(settings_path)
+    except ConfigParseError as exc:
         logger.error(
-            "Cannot clean up %s (invalid JSON: %s). Leaving file untouched.",
+            "Cannot clean up %s (%s). Leaving file untouched.",
             settings_path,
             exc,
         )
         return
-    if isinstance(settings, dict) and NATIVE_DISABLED_KEY in settings:
+    if NATIVE_DISABLED_KEY in settings:
         del settings[NATIVE_DISABLED_KEY]
         _atomic_write_json(settings_path, settings)
         logger.info("Removed legacy %s from %s", NATIVE_DISABLED_KEY, settings_path)
 
 
+# Canonical server keys that a given tool's config format cannot represent
+# (dropped by its writer).  When ``collect`` compares two sources, a missing
+# key that the source's format cannot store is not treated as a conflict and
+# is preserved from the side that has it.
+_UNSUPPORTED_CANONICAL_KEYS: dict[str, frozenset[str]] = {
+    "claude": frozenset({"tools"}),
+    "antigravity": frozenset({"tools"}),
+    "opencode": frozenset({"tools", "cwd"}),
+}
+
+
 def _configs_equal(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    """Compare two server configs for equality."""
-    return a == b
+    """Compare two server configs for equality after ``${env:VAR}`` expansion."""
+    return _resolve_vscode_vars(a) == _resolve_vscode_vars(b)
+
+
+def _merge_equivalent_configs(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    """Merge two equivalent configs, keeping ``${env:VAR}`` placeholders and any extra keys."""
+    merged: dict[str, Any] = {}
+    for key in dict.fromkeys((*a, *b)):
+        if key in a and key in b:
+            merged[key] = _prefer_vscode_vars(a[key], b[key])
+        elif key in a:
+            merged[key] = a[key]
+        else:
+            merged[key] = b[key]
+    return merged
 
 
 def _prompt_conflict(
@@ -1033,14 +1097,21 @@ def _prompt_conflict(
 
 
 def collect(config: dict[str, Any], *, interactive: bool = True) -> dict[str, Any]:
-    """Read MCP servers from all configured targets and merge into master.
+    """Read MCP servers from the configured ``init-source`` tools and merge into master.
+
+    Which tools are read (and in what priority order) is controlled by the
+    ``init-source`` list in ``config.yaml`` (defaulting to
+    :data:`DEFAULT_INIT_SOURCES` when omitted).
 
     Disable state lives exclusively in ``mcp.disabled.yaml`` (see
     :func:`load_disabled`); readers strip any legacy per-entry ``disabled``
-    field so it never enters the master.
+    field so it never enters the master.  ``${env:VAR}`` placeholders are
+    preserved when another source holds the expanded environment value, and
+    keys that a tool's schema cannot store (e.g. Codex ``tools`` in Claude)
+    do not trigger false conflicts.
 
-    When two sources define the same server name with different commands or
-    arguments, the user is prompted to pick one (when *interactive* is True
+    When two sources define the same server name with genuinely different
+    settings, the user is prompted to pick one (when *interactive* is True
     and stdin is a TTY). Otherwise the later source silently wins, matching
     legacy behaviour, but a warning is logged.
 
@@ -1055,24 +1126,45 @@ def collect(config: dict[str, Any], *, interactive: bool = True) -> dict[str, An
         name: {k: v for k, v in cfg.items() if k not in _READER_DROPPED_KEYS} for name, cfg in raw_servers.items()
     }
     sources: dict[str, str] = {name: "master" for name in servers}
+    unrepresentable: dict[str, frozenset[str]] = {name: frozenset() for name in servers}
 
     can_prompt = interactive and sys.stdin.isatty()
 
     targets = config.get("targets", {})
-    for tool, tcfg in targets.items():
+    default_targets = default_config()["targets"]
+    for tool in _resolve_init_sources(config):
         if tool not in READERS:
-            logger.warning("Skipping unknown tool: %s", tool)
+            logger.warning(
+                "Skipping unknown %s tool: %s (known: %s)",
+                INIT_SOURCE_KEY,
+                tool,
+                ", ".join(sorted(READERS)),
+            )
             continue
-        target_path = resolve_target_path(tool, tcfg["path"])
+        target_dir = targets[tool]["path"] if tool in targets else default_targets[tool]["path"]
+        target_path = resolve_target_path(tool, target_dir)
         tool_servers = READERS[tool](target_path)
         if not tool_servers:
             continue
         logger.info("Collected %d server(s) from %s", len(tool_servers), tool)
+        unrep_new = _UNSUPPORTED_CANONICAL_KEYS.get(tool, frozenset())
         for name, new_cfg in tool_servers.items():
-            if name in servers and not _configs_equal(servers[name], new_cfg):
+            if name not in servers:
+                servers[name] = new_cfg
+                sources[name] = tool
+                unrepresentable[name] = unrep_new
+                continue
+            cur_cfg = servers[name]
+            unrep_cur = unrepresentable[name]
+            cur_proj = {k: v for k, v in cur_cfg.items() if k in new_cfg or k not in unrep_new}
+            new_proj = {k: v for k, v in new_cfg.items() if k in cur_cfg or k not in unrep_cur}
+            if _configs_equal(cur_proj, new_proj):
+                servers[name] = _merge_equivalent_configs(cur_cfg, new_cfg)
+                unrepresentable[name] = unrep_cur & unrep_new
+            else:
                 current_source = sources.get(name, "?")
                 if can_prompt:
-                    use_new = _prompt_conflict(name, current_source, servers[name], tool, new_cfg)
+                    use_new = _prompt_conflict(name, current_source, cur_cfg, tool, new_cfg)
                 else:
                     use_new = True
                     logger.warning(
@@ -1084,9 +1176,7 @@ def collect(config: dict[str, Any], *, interactive: bool = True) -> dict[str, An
                 if use_new:
                     servers[name] = new_cfg
                     sources[name] = tool
-            else:
-                servers[name] = new_cfg
-                sources[name] = tool
+                    unrepresentable[name] = unrep_new
 
     # Warn about server IDs that don't follow naming conventions.
     for name in sorted(servers):
@@ -1097,8 +1187,8 @@ def collect(config: dict[str, Any], *, interactive: bool = True) -> dict[str, An
     return master
 
 
-def distribute(config: dict[str, Any], master: dict[str, Any]) -> None:
-    """Write the master MCP config to all configured targets.
+def distribute(config: dict[str, Any], master: dict[str, Any]) -> list[str]:
+    """Write the master MCP config to all configured targets atomically.
 
     Every master server is written to every configured tool.  Disable
     state comes exclusively from ``mcp.disabled.yaml`` (see
@@ -1123,14 +1213,19 @@ def distribute(config: dict[str, Any], master: dict[str, Any]) -> None:
     * **VSCode** — ``disabled_names`` is ignored; VSCode has no JSON-level
       disable mechanism, so every server is written enabled.
 
-    For MCP-dedicated target files (vscode, copilot) the existing file is
-    deleted before the writer runs so stale entries can't linger.
-    Shared-purpose target files (claude, codex, gemini, antigravity,
-    opencode) are left in place and only their MCP section is overwritten.
+    Every writer replaces only the MCP servers section in place (via an
+    atomic temp-file rename), so removed servers never linger while
+    unrelated keys and sections (such as VSCode's ``inputs`` array) are
+    preserved.  A target file that cannot be parsed is left untouched
+    rather than clobbered: the error is logged, that target is skipped,
+    and the remaining targets are still written.
+
+    Returns the names of the tools that could not be updated.
     """
     servers = master.get("mcpServers", {})
     disabled_data = load_disabled(config["source"])
     known_servers = set(servers)
+    failed: list[str] = []
 
     for tool, tcfg in config.get("targets", {}).items():
         if tool not in WRITERS:
@@ -1139,13 +1234,14 @@ def distribute(config: dict[str, Any], master: dict[str, Any]) -> None:
         disabled_set = disabled_for_tool(disabled_data, tool) & known_servers
 
         target_path = resolve_target_path(tool, tcfg["path"])
-        # Wipe MCP-dedicated files so removed servers don't linger.
-        if tool in MCP_DEDICATED_TOOLS and target_path.exists():
-            target_path.unlink()
-
         # VSCode handles ${env:VAR} natively; resolve for all other targets.
         resolved = servers if tool == "vscode" else _resolve_vscode_vars(servers)
-        count, skipped = WRITERS[tool](target_path, resolved, disabled_names=disabled_set)
+        try:
+            count, skipped = WRITERS[tool](target_path, resolved, disabled_names=disabled_set)
+        except ConfigParseError as exc:
+            logger.error("\033[31mCannot update %s (%s). Leaving file untouched.\033[0m", tool, exc)
+            failed.append(tool)
+            continue
         logger.info("Wrote %d server(s) to %s (%s)", count, tool, target_path)
         for name in sorted(disabled_set):
             logger.info("\033[33m  ↳ disabled: %s\033[0m", name)
@@ -1153,6 +1249,7 @@ def distribute(config: dict[str, Any], master: dict[str, Any]) -> None:
             logger.info("\033[31m  ↳ skipped %s\033[0m", reason)
         if tool == "claude":
             _cleanup_legacy_claude(tcfg["path"])
+    return failed
 
 
 # ---------------------------------------------------------------------------
@@ -1267,11 +1364,18 @@ def cmd_pull(args: Pull) -> None:
 
 
 def cmd_sync(args: Sync) -> None:
-    """Distribute master MCP config to all targets."""
+    """Distribute master MCP config to all targets.
+
+    Raises:
+        McpShareError: If any target could not be updated (so the process
+            exits non-zero); the other targets are still written.
+    """
     config = load_config()
     master = load_master(config["source"])
     logger.info("Distributing to targets...")
-    distribute(config, master)
+    failed = distribute(config, master)
+    if failed:
+        raise McpShareError(f"Sync incomplete: could not update {', '.join(failed)} (see errors above).")
     logger.info("Sync complete.")
 
 
@@ -1283,10 +1387,12 @@ def cmd_status(args: Status) -> None:
     servers = master.get("mcpServers", {})
     disabled_data = load_disabled(source_dir)
 
+    init_sources = _resolve_init_sources(config)
     # Status output is user-facing, so print() is intentional here.
-    print(f"Config: {CONFIG_FILE}")
-    print(f"Source: {source_dir}")
-    print(f"Mode:   {config.get('mode', 'merge')}")
+    print(f"Config:       {CONFIG_FILE}")
+    print(f"Source:       {source_dir}")
+    print(f"Init sources: {', '.join(init_sources) if init_sources else '(none)'}")
+    print(f"Mode:         {config.get('mode', 'merge')}")
     print(f"Master servers ({len(servers)}):")
     global_disabled = set(disabled_data.get(DISABLED_ALL, []))
     for name in sorted(servers):

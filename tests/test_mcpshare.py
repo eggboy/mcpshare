@@ -35,6 +35,7 @@ class TestConfig:
     def test_default_config_structure(self):
         cfg = mcpshare.default_config()
         assert "source" in cfg
+        assert cfg["init-source"] == ["vscode", "copilot"]
         assert "mode" in cfg
         assert "targets" in cfg
         assert cfg["mode"] == "merge"
@@ -47,15 +48,52 @@ class TestConfig:
         assert cfg["targets"]["claude"]["path"] == str(Path.home() / ".claude")
 
     def test_save_and_load_config(self, tmp_home):
-        cfg = {"source": "/tmp/master", "mode": "merge", "targets": {}}
+        cfg = {"source": "/tmp/master", "init-source": ["vscode", "claude"], "mode": "merge", "targets": {}}
         mcpshare.save_config(cfg)
         loaded = mcpshare.load_config()
         assert loaded == cfg
+        assert not mcpshare.CONFIG_FILE.with_name(mcpshare.CONFIG_FILE.name + ".tmp").exists()
 
     def test_load_config_raises_when_missing(self, tmp_home):
         """load_config raises ConfigNotFoundError when no config exists."""
         with pytest.raises(mcpshare.ConfigNotFoundError, match="Config not found"):
             mcpshare.load_config()
+
+    def test_load_config_raises_on_invalid_yaml(self, tmp_home):
+        mcpshare.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        mcpshare.CONFIG_FILE.write_text(":::invalid: [yaml")
+        with pytest.raises(mcpshare.ConfigParseError, match="Invalid YAML"):
+            mcpshare.load_config()
+
+    @pytest.mark.parametrize(
+        "config,expected",
+        [
+            pytest.param(
+                {"targets": {"vscode": {}, "copilot": {}, "claude": {}}},
+                ["vscode", "copilot"],
+                id="omitted-falls-back-to-defaults",
+            ),
+            pytest.param(
+                {"targets": {"claude": {}}},
+                [],
+                id="omitted-filters-to-configured-targets",
+            ),
+            pytest.param(
+                {"init-source": ["vscode", "claude", "vscode"], "targets": {}},
+                ["vscode", "claude"],
+                id="explicit-preserves-order-and-deduplicates",
+            ),
+            pytest.param({"init-source": [], "targets": {"vscode": {}}}, [], id="explicit-empty-list"),
+            pytest.param({"init-source": None, "targets": {"vscode": {}}}, [], id="explicit-null"),
+        ],
+    )
+    def test_resolve_init_sources(self, config, expected):
+        assert mcpshare._resolve_init_sources(config) == expected
+
+    @pytest.mark.parametrize("bad_value", ["vscode", {"vscode": True}, [123]])
+    def test_resolve_init_sources_rejects_non_string_list(self, bad_value):
+        with pytest.raises(mcpshare.ConfigParseError, match="init-source"):
+            mcpshare._resolve_init_sources({"init-source": bad_value, "targets": {}})
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +141,49 @@ class TestMaster:
         (source / "mcp.json").write_text("{not valid json")
         with pytest.raises(mcpshare.ConfigParseError, match="Invalid JSON"):
             mcpshare.load_master(str(source))
+
+    def test_load_master_empty_file_returns_empty_servers(self, tmp_path):
+        """An empty (e.g. freshly touched) master file is not an error."""
+        source = tmp_path / "empty_master"
+        source.mkdir()
+        (source / "mcp.json").write_text("")
+        assert mcpshare.load_master(str(source)) == {"mcpServers": {}}
+
+
+# ---------------------------------------------------------------------------
+# JSON file helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestLoadJsonObject:
+    def test_missing_file_returns_empty_object(self, tmp_path):
+        assert mcpshare._load_json_object(tmp_path / "nope.json") == {}
+
+    @pytest.mark.parametrize("content", ["", "\n", "   \n\t  "])
+    def test_empty_or_whitespace_file_returns_empty_object(self, tmp_path, content):
+        """Antigravity creates mcp_config.json as a 0-byte placeholder; that must parse as {}."""
+        path = tmp_path / "mcp_config.json"
+        path.write_text(content)
+        assert mcpshare._load_json_object(path) == {}
+
+    def test_returns_parsed_object(self, tmp_path):
+        path = tmp_path / "f.json"
+        path.write_text(json.dumps({"a": {"b": 1}}))
+        assert mcpshare._load_json_object(path) == {"a": {"b": 1}}
+
+    def test_invalid_json_raises_with_path(self, tmp_path):
+        path = tmp_path / "f.json"
+        path.write_text("{not valid json")
+        with pytest.raises(mcpshare.ConfigParseError, match=f"Invalid JSON in {path}"):
+            mcpshare._load_json_object(path)
+
+    @pytest.mark.parametrize("content", ["[]", "null", '"text"', "42"])
+    def test_non_object_top_level_raises(self, tmp_path, content):
+        """A writer can't merge mcpServers into a list/null/scalar, so refuse rather than clobber."""
+        path = tmp_path / "f.json"
+        path.write_text(content)
+        with pytest.raises(mcpshare.ConfigParseError, match="Expected JSON object"):
+            mcpshare._load_json_object(path)
 
 
 # ---------------------------------------------------------------------------
@@ -288,13 +369,36 @@ class TestReaders:
         for reader in mcpshare.READERS.values():
             assert reader(tmp_path / "nope") == {}
 
-    @pytest.mark.parametrize("reader_name", ["vscode", "claude", "copilot", "gemini", "opencode"])
+    @pytest.mark.parametrize("reader_name", ["vscode", "claude", "copilot", "gemini", "antigravity", "opencode"])
     def test_read_raises_on_invalid_json(self, tmp_path, reader_name):
         """JSON-based readers raise ConfigParseError on malformed input."""
         path = tmp_path / "bad.json"
         path.write_text("{not valid json")
         with pytest.raises(mcpshare.ConfigParseError, match="Invalid JSON"):
             mcpshare.READERS[reader_name](path)
+
+    def test_read_codex_raises_on_invalid_toml(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text("[mcp_servers.broken\ncommand = ")
+        with pytest.raises(mcpshare.ConfigParseError, match="Invalid TOML"):
+            mcpshare.read_codex(path)
+
+    @pytest.mark.parametrize(
+        "reader",
+        [
+            mcpshare.read_vscode,
+            mcpshare.read_claude,
+            mcpshare.read_copilot,
+            mcpshare.read_gemini,
+            mcpshare.read_antigravity,
+            mcpshare.read_opencode,
+        ],
+    )
+    def test_read_empty_file_returns_empty(self, tmp_path, reader):
+        """An empty placeholder file holds no servers; it is not a parse error."""
+        path = tmp_path / "empty.json"
+        path.write_text("")
+        assert reader(path) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +584,90 @@ class TestWriters:
         assert data["theme"] == "dark"
         assert "mcp" in data
 
+    # Every JSON writer does a read-modify-write of its target file, so each
+    # must cope with the file existing but holding nothing (or garbage).
+    JSON_WRITERS = [
+        pytest.param(mcpshare.write_vscode, "mcp.json", "servers", id="vscode"),
+        pytest.param(mcpshare.write_claude, ".claude.json", "mcpServers", id="claude"),
+        pytest.param(mcpshare.write_copilot, "mcp-config.json", "mcpServers", id="copilot"),
+        pytest.param(mcpshare.write_gemini, "settings.json", "mcpServers", id="gemini"),
+        pytest.param(mcpshare.write_antigravity, "mcp_config.json", "mcpServers", id="antigravity"),
+        pytest.param(mcpshare.write_opencode, "opencode.json", "mcp", id="opencode"),
+    ]
+
+    @pytest.mark.parametrize("writer,filename,section", JSON_WRITERS)
+    @pytest.mark.parametrize("content", ["", "  \n"], ids=["empty", "whitespace"])
+    def test_write_treats_empty_existing_file_as_empty_object(
+        self, tmp_path, sample_servers, writer, filename, section, content
+    ):
+        """Regression: Antigravity ships a 0-byte mcp_config.json, which used to crash json.load."""
+        path = tmp_path / filename
+        path.write_text(content)
+        count, skipped = writer(path, sample_servers)
+        data = json.loads(path.read_text())
+        assert set(data[section]) == {"filesystem", "github"}
+        assert (count, skipped) == (2, [])
+
+    @pytest.mark.parametrize("writer,filename,section", JSON_WRITERS)
+    def test_write_raises_on_invalid_json_and_leaves_file_untouched(
+        self, tmp_path, sample_servers, writer, filename, section
+    ):
+        """A file we can't parse may hold settings we can't see; never overwrite it."""
+        path = tmp_path / filename
+        path.write_text("{not valid json")
+        with pytest.raises(mcpshare.ConfigParseError, match="Invalid JSON"):
+            writer(path, sample_servers)
+        assert path.read_text() == "{not valid json"
+        assert not path.with_name(filename + ".tmp").exists()
+
+    @pytest.mark.parametrize("writer,filename,section", JSON_WRITERS)
+    def test_write_raises_on_non_object_top_level(self, tmp_path, sample_servers, writer, filename, section):
+        path = tmp_path / filename
+        path.write_text("[1, 2, 3]")
+        with pytest.raises(mcpshare.ConfigParseError, match="Expected JSON object"):
+            writer(path, sample_servers)
+        assert path.read_text() == "[1, 2, 3]"
+
+    def test_write_codex_raises_on_invalid_toml_and_leaves_file_untouched(self, tmp_path, sample_servers):
+        path = tmp_path / "config.toml"
+        path.write_text("[settings\nbroken = ")
+        with pytest.raises(mcpshare.ConfigParseError, match="Invalid TOML"):
+            mcpshare.write_codex(path, sample_servers)
+        assert path.read_text() == "[settings\nbroken = "
+        assert not path.with_name("config.toml.tmp").exists()
+
+    ALL_WRITERS = [
+        pytest.param(mcpshare.write_vscode, "mcp.json", "{}\n", id="vscode"),
+        pytest.param(mcpshare.write_claude, ".claude.json", "{}\n", id="claude"),
+        pytest.param(mcpshare.write_copilot, "mcp-config.json", "{}\n", id="copilot"),
+        pytest.param(mcpshare.write_codex, "config.toml", '[settings]\nmodel = "o3"\n', id="codex"),
+        pytest.param(mcpshare.write_gemini, "settings.json", "{}\n", id="gemini"),
+        pytest.param(mcpshare.write_antigravity, "mcp_config.json", "{}\n", id="antigravity"),
+        pytest.param(mcpshare.write_opencode, "opencode.json", "{}\n", id="opencode"),
+    ]
+
+    @pytest.mark.parametrize("writer,filename,seed", ALL_WRITERS)
+    def test_all_writers_are_atomic_preserve_symlinks_and_permissions(
+        self, tmp_path, sample_servers, writer, filename, seed
+    ):
+        """Every writer writes through symlinks, preserves file mode, and leaves no .tmp file."""
+        real_dir = tmp_path / "dotfiles"
+        real_dir.mkdir()
+        real = real_dir / filename
+        real.write_text(seed)
+        real.chmod(0o600)
+        link_dir = tmp_path / "target"
+        link_dir.mkdir()
+        link = link_dir / filename
+        link.symlink_to(real)
+
+        writer(link, sample_servers)
+
+        assert link.is_symlink()
+        assert real.stat().st_mode & 0o777 == 0o600
+        assert not real_dir.joinpath(filename + ".tmp").exists()
+        assert not link_dir.joinpath(filename + ".tmp").exists()
+
 
 # ---------------------------------------------------------------------------
 # Round-trip tests (read → write → read)
@@ -493,6 +681,7 @@ class TestRoundTrip:
             ("vscode", mcpshare.write_vscode, mcpshare.read_vscode, "mcp.json"),
             ("claude", mcpshare.write_claude, mcpshare.read_claude, ".claude.json"),
             ("copilot", mcpshare.write_copilot, mcpshare.read_copilot, "mcp-config.json"),
+            ("codex", mcpshare.write_codex, mcpshare.read_codex, "config.toml"),
             ("gemini", mcpshare.write_gemini, mcpshare.read_gemini, "settings.json"),
             ("antigravity", mcpshare.write_antigravity, mcpshare.read_antigravity, "mcp_config.json"),
             ("opencode", mcpshare.write_opencode, mcpshare.read_opencode, "opencode.json"),
@@ -504,12 +693,24 @@ class TestRoundTrip:
         result = reader(path)
         assert result == sample_servers
 
-    def test_round_trip_antigravity_url_server(self, tmp_path):
-        """url → serverUrl on write and serverUrl → url on read."""
-        path = tmp_path / "mcp_config.json"
+    @pytest.mark.parametrize(
+        "writer,reader,filename",
+        [
+            pytest.param(mcpshare.write_vscode, mcpshare.read_vscode, "mcp.json", id="vscode"),
+            pytest.param(mcpshare.write_claude, mcpshare.read_claude, ".claude.json", id="claude"),
+            pytest.param(mcpshare.write_copilot, mcpshare.read_copilot, "mcp-config.json", id="copilot"),
+            pytest.param(mcpshare.write_codex, mcpshare.read_codex, "config.toml", id="codex"),
+            pytest.param(mcpshare.write_gemini, mcpshare.read_gemini, "settings.json", id="gemini"),
+            pytest.param(mcpshare.write_antigravity, mcpshare.read_antigravity, "mcp_config.json", id="antigravity"),
+            pytest.param(mcpshare.write_opencode, mcpshare.read_opencode, "opencode.json", id="opencode"),
+        ],
+    )
+    def test_round_trip_remote_url_server(self, tmp_path, writer, reader, filename):
+        """Remote URL + headers round-trips across all 7 tools (including serverUrl and http_headers)."""
+        path = tmp_path / filename
         servers = {"remote": {"url": "https://example.com/mcp", "headers": {"X-Key": "k"}}}
-        mcpshare.write_antigravity(path, servers)
-        assert mcpshare.read_antigravity(path) == servers
+        writer(path, servers)
+        assert reader(path) == servers
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +726,7 @@ class TestCollectDistribute:
             tdir = tmp_path / tool
             tdir.mkdir()
             targets[tool] = {"path": str(tdir)}
-        return {"source": source, "mode": "merge", "targets": targets}
+        return {"source": source, "init-source": list(targets), "mode": "merge", "targets": targets}
 
     def test_collect_merges_from_targets(self, tmp_path, sample_servers):
         config = self._make_config(tmp_path)
@@ -539,6 +740,42 @@ class TestCollectDistribute:
         master = mcpshare.collect(config)
         assert "filesystem" in master["mcpServers"]
         assert "github" in master["mcpServers"]
+
+    def test_collect_only_reads_configured_init_sources(self, tmp_path, sample_servers):
+        """Tools absent from init-source are never pulled, even when configured in targets."""
+        config = self._make_config(tmp_path)
+        config["init-source"] = ["vscode", "claude"]
+
+        mcpshare.write_vscode(
+            mcpshare.resolve_target_path("vscode", config["targets"]["vscode"]["path"]),
+            {"filesystem": sample_servers["filesystem"]},
+        )
+        mcpshare.write_claude(
+            mcpshare.resolve_target_path("claude", config["targets"]["claude"]["path"]),
+            {"github": sample_servers["github"]},
+        )
+        mcpshare.write_gemini(
+            mcpshare.resolve_target_path("gemini", config["targets"]["gemini"]["path"]),
+            {"ignored-mcp": {"command": "uvx", "args": ["ignored"]}},
+        )
+
+        master = mcpshare.collect(config, interactive=False)
+        assert set(master["mcpServers"]) == {"filesystem", "github"}
+
+    def test_collect_warns_and_skips_unknown_init_source(self, tmp_path, sample_servers, caplog):
+        """A typo like 'cluade' in init-source logs a clear warning and continues."""
+        config = self._make_config(tmp_path)
+        config["init-source"] = ["vscode", "cluade"]
+        mcpshare.write_vscode(
+            mcpshare.resolve_target_path("vscode", config["targets"]["vscode"]["path"]),
+            {"filesystem": sample_servers["filesystem"]},
+        )
+
+        with caplog.at_level("WARNING"):
+            master = mcpshare.collect(config, interactive=False)
+
+        assert set(master["mcpServers"]) == {"filesystem"}
+        assert "cluade" in caplog.text
 
     def test_distribute_writes_all_targets(self, tmp_path, sample_servers):
         config = self._make_config(tmp_path)
@@ -614,6 +851,40 @@ class TestCLI:
         mcpshare.cmd_init(args)
         cfg = mcpshare.load_config()
         assert cfg["source"] == mcpshare.default_config()["source"]
+
+    def _setup_sync(self, tmp_path, sample_servers, tools):
+        source = str(tmp_path / "master")
+        mcpshare.save_master(source, {"mcpServers": sample_servers})
+        targets = {}
+        for tool in tools:
+            tdir = tmp_path / tool
+            tdir.mkdir(exist_ok=True)
+            targets[tool] = {"path": str(tdir)}
+        mcpshare.save_config({"source": source, "mode": "merge", "targets": targets})
+        return targets
+
+    def test_sync_completes_with_empty_antigravity_placeholder(self, tmp_home, tmp_path, sample_servers):
+        """The reported crash: `mcpshare sync` against Antigravity's 0-byte mcp_config.json."""
+        targets = self._setup_sync(tmp_path, sample_servers, ("antigravity",))
+        ag_path = mcpshare.resolve_target_path("antigravity", targets["antigravity"]["path"])
+        ag_path.touch()
+
+        mcpshare.cmd_sync(mcpshare.Sync())
+
+        assert set(json.loads(ag_path.read_text())["mcpServers"]) == {"filesystem", "github"}
+
+    def test_sync_fails_when_a_target_cannot_be_updated(self, tmp_home, tmp_path, sample_servers):
+        """A skipped target turns into a non-zero exit via McpShareError, after the others are written."""
+        targets = self._setup_sync(tmp_path, sample_servers, ("antigravity", "opencode"))
+        ag_path = mcpshare.resolve_target_path("antigravity", targets["antigravity"]["path"])
+        oc_path = mcpshare.resolve_target_path("opencode", targets["opencode"]["path"])
+        ag_path.write_text("{not valid json")
+
+        with pytest.raises(mcpshare.McpShareError, match="Sync incomplete: could not update antigravity"):
+            mcpshare.cmd_sync(mcpshare.Sync())
+
+        assert ag_path.read_text() == "{not valid json"
+        assert set(json.loads(oc_path.read_text())["mcp"]) == {"filesystem", "github"}
 
 
 # ---------------------------------------------------------------------------
@@ -983,9 +1254,75 @@ class TestCollectConflicts:
         # The flag is stripped during collect; mcp.disabled.yaml owns disable state.
         assert "disabled" not in master["mcpServers"]["foo-mcp"]
 
+    @pytest.mark.parametrize("init_order", [["vscode", "copilot"], ["copilot", "vscode"]])
+    def test_vscode_env_placeholder_does_not_conflict_or_leak_secret_after_sync(
+        self, tmp_path, monkeypatch, init_order
+    ):
+        """Regression: sync expands ${env:VAR} into Copilot; pull must not conflict or store the secret."""
+        monkeypatch.setenv("GH_MCP_TOKEN", "s3cr3t-value")
+        source = str(tmp_path / "master")
+        targets = {}
+        for tool in ("vscode", "copilot"):
+            tdir = tmp_path / tool
+            tdir.mkdir()
+            targets[tool] = {"path": str(tdir)}
+        config = {"source": source, "init-source": init_order, "mode": "merge", "targets": targets}
+
+        seeded = {"gh-mcp": {"command": "npx", "args": ["-y", "gh"], "env": {"TOKEN": "${env:GH_MCP_TOKEN}"}}}
+        mcpshare.save_master(source, {"mcpServers": seeded})
+        mcpshare.distribute(config, {"mcpServers": seeded})
+
+        def fail_prompt(*_a, **_kw):
+            raise AssertionError("${env:VAR} vs its resolved value must not prompt as a conflict")
+
+        monkeypatch.setattr(mcpshare, "_prompt_conflict", fail_prompt)
+        monkeypatch.setattr(mcpshare.sys.stdin, "isatty", lambda: True)
+
+        # Both interactive and non-interactive pulls preserve ${env:GH_MCP_TOKEN}.
+        assert mcpshare.collect(config, interactive=True)["mcpServers"] == seeded
+        assert mcpshare.collect(config, interactive=False)["mcpServers"] == seeded
+
+    def test_vscode_env_placeholder_upgrades_literal_on_initial_pull(self, tmp_path, monkeypatch):
+        """When master is empty and copilot precedes vscode, the ${env:VAR} placeholder still wins."""
+        monkeypatch.setenv("GH_MCP_TOKEN", "s3cr3t-value")
+        config = self._seed(
+            tmp_path,
+            vscode_cfg={"command": "npx", "env": {"TOKEN": "${env:GH_MCP_TOKEN}"}},
+            copilot_cfg={"command": "npx", "env": {"TOKEN": "s3cr3t-value"}},
+        )
+        config["init-source"] = ["copilot", "vscode"]
+
+        master = mcpshare.collect(config, interactive=False)
+        assert master["mcpServers"]["shared-mcp"]["env"]["TOKEN"] == "${env:GH_MCP_TOKEN}"
+
+    @pytest.mark.parametrize("init_order", [["vscode", "claude"], ["claude", "vscode"]])
+    def test_schema_unsupported_keys_do_not_conflict_or_get_stripped_on_pull(self, tmp_path, monkeypatch, init_order):
+        """Claude drops Codex 'tools' on write; pulling from Claude must neither conflict nor erase 'tools'."""
+        source = str(tmp_path / "master")
+        targets = {}
+        for tool in ("vscode", "claude", "opencode"):
+            tdir = tmp_path / tool
+            tdir.mkdir()
+            targets[tool] = {"path": str(tdir)}
+        config = {"source": source, "init-source": [*init_order, "opencode"], "mode": "merge", "targets": targets}
+
+        seeded = {
+            "azure-mcp": {"command": "npx", "args": ["-y", "@azure/mcp"], "cwd": "/tmp", "tools": ["*"]},
+        }
+        mcpshare.save_master(source, {"mcpServers": seeded})
+        mcpshare.distribute(config, {"mcpServers": seeded})
+
+        def fail_prompt(*_a, **_kw):
+            raise AssertionError("schema-dropped keys must not trigger a conflict")
+
+        monkeypatch.setattr(mcpshare, "_prompt_conflict", fail_prompt)
+        monkeypatch.setattr(mcpshare.sys.stdin, "isatty", lambda: True)
+
+        assert mcpshare.collect(config, interactive=False)["mcpServers"] == seeded
+
 
 # ---------------------------------------------------------------------------
-# Distribute: file deletion and per-IDE disabled list filtering
+# Distribute: in-place MCP section replacement and per-IDE disabled filtering
 # ---------------------------------------------------------------------------
 
 
@@ -1000,19 +1337,95 @@ class TestDistributeBehavior:
         source.mkdir(exist_ok=True)
         return {"source": str(source), "mode": "merge", "targets": targets}
 
-    def test_dedicated_file_is_recreated_not_merged(self, tmp_home, tmp_path, sample_servers):
-        """An old VSCode mcp.json with stale top-level keys is removed before write."""
+    def test_vscode_replaces_stale_servers_while_preserving_inputs(self, tmp_home, tmp_path, sample_servers):
+        """Removed servers disappear from VSCode mcp.json, while VSCode's top-level 'inputs' survives."""
         config = self._make_config(tmp_path, tools=("vscode",))
         vscode_path = mcpshare.resolve_target_path("vscode", config["targets"]["vscode"]["path"])
-        # Seed with an unrelated stale top-level key.
-        vscode_path.write_text(json.dumps({"servers": {"stale-mcp": {"command": "old"}}, "stale_top_key": 1}))
+        inputs = [{"id": "api-key", "type": "promptString", "description": "API Key", "password": True}]
+        vscode_path.write_text(
+            json.dumps(
+                {
+                    "inputs": inputs,
+                    "servers": {"stale-mcp": {"type": "stdio", "command": "old"}},
+                }
+            )
+        )
         master = {"mcpServers": {"filesystem": sample_servers["filesystem"]}}
 
         mcpshare.distribute(config, master)
 
         data = json.loads(vscode_path.read_text())
-        assert "stale_top_key" not in data, "dedicated MCP file must be wiped before write"
+        assert data["inputs"] == inputs
         assert set(data["servers"]) == {"filesystem"}
+
+    def test_vscode_invalid_json_is_left_untouched_not_deleted(self, tmp_home, tmp_path, sample_servers, caplog):
+        """A syntax typo in VSCode mcp.json must not cause sync to delete the user's file."""
+        config = self._make_config(tmp_path, tools=("vscode",))
+        vscode_path = mcpshare.resolve_target_path("vscode", config["targets"]["vscode"]["path"])
+        vscode_path.write_text("{not valid json")
+
+        with caplog.at_level("ERROR"):
+            failed = mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        assert failed == ["vscode"]
+        assert vscode_path.read_text() == "{not valid json"
+
+    # ---- unparseable / empty target files ----
+
+    def test_antigravity_empty_placeholder_file_is_synced(self, tmp_home, tmp_path, sample_servers):
+        """Regression: Antigravity creates a 0-byte mcp_config.json; sync must fill it, not crash."""
+        config = self._make_config(tmp_path, tools=("antigravity",))
+        ag_path = mcpshare.resolve_target_path("antigravity", config["targets"]["antigravity"]["path"])
+        ag_path.touch()
+
+        failed = mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        assert failed == []
+        assert set(json.loads(ag_path.read_text())["mcpServers"]) == {"filesystem", "github"}
+
+    def test_invalid_target_file_is_skipped_and_others_still_written(self, tmp_home, tmp_path, sample_servers, caplog):
+        """One unparseable shared-purpose file must not abort the sync or get clobbered."""
+        config = self._make_config(tmp_path, tools=("antigravity", "gemini"))
+        ag_path = mcpshare.resolve_target_path("antigravity", config["targets"]["antigravity"]["path"])
+        gemini_path = mcpshare.resolve_target_path("gemini", config["targets"]["gemini"]["path"])
+        ag_path.write_text("{not valid json")
+
+        with caplog.at_level("ERROR"):
+            failed = mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        assert failed == ["antigravity"]
+        assert ag_path.read_text() == "{not valid json"
+        assert "Cannot update antigravity" in caplog.text
+        assert str(ag_path) in caplog.text
+        assert set(json.loads(gemini_path.read_text())["mcpServers"]) == {"filesystem", "github"}
+
+    def test_copilot_invalid_settings_json_is_left_untouched(self, tmp_home, tmp_path, sample_servers, caplog):
+        """A malformed Copilot settings.json blocks only the disabled list, not mcp-config.json."""
+        config = self._make_config(tmp_path, tools=("copilot",))
+        copilot_dir = Path(config["targets"]["copilot"]["path"])
+        (copilot_dir / "settings.json").write_text("{not valid json")
+        mcpshare.save_disabled(config["source"], {"*": ["filesystem"]})
+
+        with caplog.at_level("ERROR"):
+            mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        assert (copilot_dir / "settings.json").read_text() == "{not valid json"
+        assert "Cannot update" in caplog.text
+        servers_data = json.loads((copilot_dir / "mcp-config.json").read_text())
+        assert set(servers_data["mcpServers"]) == {"filesystem", "github"}
+
+    def test_claude_cleanup_tolerates_empty_settings_json(self, tmp_home, tmp_path, sample_servers, caplog):
+        """An empty ~/.claude/settings.json has nothing to clean up and is not an error."""
+        config = self._make_config(tmp_path, tools=("claude",))
+        claude_dir = Path(config["targets"]["claude"]["path"])
+        (claude_dir / "settings.json").write_text("")
+
+        with caplog.at_level("ERROR"):
+            failed = mcpshare.distribute(config, {"mcpServers": sample_servers})
+
+        assert failed == []
+        assert "Cannot clean up" not in caplog.text
+        assert (claude_dir / "settings.json").read_text() == ""
 
     # ---- Gemini native disable: mcp.excluded in settings.json ----
 
@@ -1460,6 +1873,23 @@ class TestWriteNativeDisabledList:
 
         assert previous == set()
         assert json.loads(path.read_text())["disabledMcpServers"] == ["a-mcp"]
+
+    def test_empty_settings_file_is_treated_as_empty_object(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text("")
+
+        previous = mcpshare._write_native_disabled_list(path, {"a-mcp"})
+
+        assert previous == set()
+        assert json.loads(path.read_text()) == {"disabledMcpServers": ["a-mcp"]}
+
+    def test_invalid_settings_file_raises_config_parse_error(self, tmp_path):
+        """Callers (see _emit_native_disabled) rely on ConfigParseError, not a raw JSONDecodeError."""
+        path = tmp_path / "settings.json"
+        path.write_text("{not valid json")
+        with pytest.raises(mcpshare.ConfigParseError, match="Invalid JSON"):
+            mcpshare._write_native_disabled_list(path, {"a-mcp"})
+        assert path.read_text() == "{not valid json"
 
 
 # ---------------------------------------------------------------------------

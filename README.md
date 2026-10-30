@@ -41,7 +41,10 @@ The config file lives at `~/.config/mcpshare/config.yaml`:
 
 ```yaml
 source: /path/to/master          # directory for the canonical mcp.json
-mode: merge                      # merge | overwrite
+init-source:                     # tools (in priority order) that `mcpshare pull` reads from
+  - vscode
+  - copilot
+mode: merge
 targets:
   claude:
     path: ~/.claude
@@ -59,23 +62,22 @@ targets:
     path: ~/.config/opencode
 ```
 
-### Modes
-
-| Mode | Behaviour |
-|------|-----------|
-| `merge` | Collect servers from every target first, merge into master, then distribute |
-| `overwrite` | Use the master as the single source of truth and overwrite all targets |
+`init-source` controls which tools `mcpshare pull` collects server entries
+from (and their order during conflict resolution). Any supported tool name
+(`vscode`, `copilot`, `claude`, `codex`, `gemini`, `antigravity`, `opencode`)
+can be listed. When omitted from an older `config.yaml`, it defaults to
+`[vscode, copilot]`.
 
 ## How it works
 
 1. **`mcpshare init`** – creates the config file and master directory.
-2. **`mcpshare pull`** – pulls MCP server entries from every configured
-   target and merges them into the master `mcp.json` (collect only, does not
-   write back to targets).
+2. **`mcpshare pull`** – pulls MCP server entries from the tools listed in
+   `init-source` and merges them into the master `mcp.json` (collect only,
+   does not write back to targets).
 3. **`mcpshare sync`** – distributes the master `mcp.json` to all configured
-   targets, converting to each tool's native format.
-4. **`mcpshare status`** – shows the master servers and whether each target
-   config file exists.
+   `targets`, converting to each tool's native format.
+4. **`mcpshare status`** – shows the master servers, `init-source` list, and
+   whether each target config file exists.
 
 Typical workflow: `mcpshare pull` → `mcpshare sync`.
 
@@ -146,13 +148,16 @@ all other keys in the target files are preserved.
 
 ### Sync semantics
 
-For MCP-dedicated target files (`mcp.json`, `mcp-config.json`), `sync`
-**deletes the file and recreates it** so removed servers cannot linger.
-For files shared with other IDE settings (`.claude.json`, `config.toml`,
-`settings.json`, `mcp_config.json`, `opencode.json`), only the MCP section
-is replaced — non-MCP content is preserved. For Copilot, the
-`disabledMcpServers` array in `settings.json` is also overwritten in place
-while preserving every other key.
+Every target file is updated **atomically in place** (temp-file + fsync +
+rename, writing through symlinks and preserving file permissions). Only the
+MCP servers section is replaced, so removed servers cannot linger while
+unrelated keys and sections — including VSCode's top-level `inputs` array,
+Claude's state in `~/.claude.json`, Gemini/OpenCode settings, and non-MCP
+TOML sections in Codex — are preserved. For Copilot, the
+`disabledMcpServers` array in `settings.json` is also updated atomically in
+place while preserving every other key. If an existing target file contains
+malformed JSON or TOML, it is left untouched and skipped rather than
+clobbered.
 
 #### Claude Code
 
@@ -192,22 +197,27 @@ The Antigravity app, IDE, and CLI (`agy`) share one global file,
 
 ### Conflict resolution on pull
 
-When `mcpshare pull` finds the same server name in two IDEs with **different**
-commands/args/env, it prompts you to pick one. Identical configs are
-silently merged, and any per-entry `disabled` / `enabled` flag found in a
-target file is stripped before comparison — so a server that differs only
-in disable state never counts as a conflict (its disable state is owned by
-`mcp.disabled.yaml`, not by the master or any target file). Pass
-`--non-interactive` (or run without a TTY) to fall back to last-write-wins
-with a warning.
+When `mcpshare pull` finds the same server name across `init-source` tools
+with **different** settings, it prompts you to pick one. Equivalent configs
+are merged silently:
+
+- Per-entry `disabled` / `enabled` flags are stripped before comparison (disable
+  state is owned by `mcp.disabled.yaml`).
+- VSCode `${env:VAR}` placeholders match their resolved environment values and
+  are preserved so expanded secrets are not written back into `mcp.json`.
+- Keys a tool's schema cannot store (such as Codex `tools` allow-lists in
+  Claude/Antigravity/OpenCode) do not count as conflicts and are preserved.
+
+Pass `--non-interactive` (or run without a TTY) to fall back to last-write-wins
+(in `init-source` order) with a warning.
 
 ### Supported formats
 
 | Tool | File | Top-level key | Notes |
 |------|------|---------------|-------|
 | Claude Code | `~/.claude.json` | `mcpServers` | Shared with Claude's state; only `mcpServers` is replaced. Adds `"type"`. Disabled servers omitted |
-| VSCode | `mcp.json` | `servers` | MCP-dedicated; recreated on sync. Adds `"type": "stdio"`. No native disable |
-| Copilot CLI | `mcp-config.json` | `mcpServers` | MCP-dedicated; recreated on sync. Adds `"type": "stdio"`. Disable via `settings.json` |
+| VSCode | `mcp.json` | `servers` | Preserves top-level `inputs` and other keys. Adds `"type": "stdio"\|"http"`. No native disable |
+| Copilot CLI | `mcp-config.json` | `mcpServers` | Preserves non-MCP keys. Adds `"type": "stdio"\|"http"`. Disable via `settings.json` |
 | Codex | `config.toml` | `[mcp_servers.*]` | TOML; preserves non-MCP sections. Native `enabled = false` |
 | Gemini CLI | `settings.json` | `mcpServers` | Preserves non-MCP settings. Disable via `mcp.excluded` (same file) |
 | Antigravity | `~/.gemini/config/mcp_config.json` | `mcpServers` | `url` written as `serverUrl`; no `type`; Codex `tools` not written. Native `"disabled": true` per entry |
