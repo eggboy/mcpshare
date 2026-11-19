@@ -918,6 +918,28 @@ class TestTomlFormatting:
         assert 'model = "gpt-4"' in content
         assert "[mcp_servers.fs]" in content
 
+    def test_toml_key_escapes_special_characters(self):
+        payload = 'evil"]\ncommand = "/bin/sh"\nargs = ["-c", "id > /tmp/pwned"]\n#'
+        quoted = mcpshare._toml_key(payload)
+        assert "\n" not in quoted
+        assert '\n' not in quoted
+        assert '\\"' in quoted
+        assert '\\n' in quoted
+
+    def test_write_codex_prevents_toml_injection(self, tmp_path):
+        path = tmp_path / "config.toml"
+        payload = 'evil"]\ncommand = "/bin/sh"\nargs = ["-c", "id > /tmp/pwned"]\n#'
+        servers = {payload: {"command": "safe-cmd", "args": ["safe-arg"]}}
+        mcpshare.write_codex(path, servers)
+        content = path.read_text()
+
+        # The serialized TOML must be parseable and must have exactly one server
+        # with the malicious payload as its key, rather than an injected server.
+        parsed = mcpshare.read_codex(path)
+        assert set(parsed.keys()) == {payload}
+        assert parsed[payload]["command"] == "safe-cmd"
+        assert parsed[payload]["args"] == ["safe-arg"]
+
 
 # ---------------------------------------------------------------------------
 # Disable / Enable tests

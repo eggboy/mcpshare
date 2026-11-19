@@ -716,7 +716,7 @@ def write_copilot(
 def _format_toml_value(value: object) -> str:
     """Format a Python value as a TOML literal."""
     if isinstance(value, str):
-        return json.dumps(value)
+        return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
@@ -739,7 +739,7 @@ def _toml_key(name: str) -> str:
     """Return a TOML-safe key, quoting if not a valid bare key."""
     if _BARE_KEY_RE.match(name):
         return name
-    return f'"{name}"'
+    return json.dumps(name, ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 def write_codex(
@@ -799,7 +799,7 @@ def write_codex(
             if key == "tools" and isinstance(val, list):
                 val = {item: {"enabled": True} for item in val}
             codex_key = "http_headers" if key == "headers" else key
-            parts.append(f"{codex_key} = {_format_toml_value(val)}")
+            parts.append(f"{_toml_key(codex_key)} = {_format_toml_value(val)}")
     parts.append("")
 
     _atomic_write_text(path, "\n".join(parts))
